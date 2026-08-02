@@ -199,7 +199,7 @@ fn build_stream_lane(
         let label = pad_to(ellipsize(&k.name, block_width), block_width);
 
         let style = if is_selected {
-            Style::new().fg(Color::White).bg(bg).bold()
+            Style::new().fg(Color::Black).bg(Color::White)
         } else {
             Style::new().fg(Color::Black).bg(bg)
         };
