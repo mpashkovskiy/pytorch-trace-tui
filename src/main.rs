@@ -11,7 +11,7 @@ use crossterm::{
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use ratatui::{backend::CrosstermBackend, Terminal};
-use std::io::{self, stdout, Write};
+use std::io::{self, stdout, BufRead, Write};
 use std::panic;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -95,11 +95,13 @@ fn select_trace_interactively() -> Result<Option<String>> {
     print!("Enter number (1-{}, or q to quit): ", traces.len());
     stdout().flush().ok();
 
-    let mut input = String::new();
+    let mut raw = Vec::new();
     io::stdin()
-        .read_line(&mut input)
+        .lock()
+        .read_until(b'\n', &mut raw)
         .context("Failed to read selection")?;
-    let input = input.trim();
+    let decoded = String::from_utf8_lossy(&raw);
+    let input = decoded.trim().trim_matches(char::from(0));
 
     if input.eq_ignore_ascii_case("q") || input.is_empty() {
         return Ok(None);
