@@ -39,23 +39,26 @@ pytorch-trace-tui
 
 | Key             | Action                          |
 | --------------- | ------------------------------- |
-| `A` / `←`       | Select previous kernel          |
-| `D` / `→`       | Select next kernel              |
+| `A` / `←`       | Select previous item in the current lane |
+| `D` / `→`       | Select next item in the current lane |
 | `W` / `↑`       | Zoom in                         |
 | `S` / `↓`       | Zoom out                        |
-| `Tab`           | Next GPU stream                 |
-| `Shift+Tab`     | Previous GPU stream             |
-| `/`             | Incremental kernel name search  |
+| `Tab`           | Next lane                       |
+| `Shift+Tab`     | Previous lane                   |
+| `/`             | Incremental name search (kernels and annotations) |
 | `Q` / `Esc`     | Quit                            |
 
-Streams that contain `gpu_user_annotation` events get an extra annotation lane
-rendered directly above their kernel lane, sharing the same time axis. The
-annotation lane is display-only — it shows the execution context spanning the
-kernels below it; navigation and search always operate on the kernels.
+Every timeline row is a **lane**. A stream contributes a kernel lane, and — if it
+has `gpu_user_annotation` events — an annotation lane rendered directly above it,
+sharing the same time axis. All lanes behave identically: `Tab`/`Shift+Tab` move
+between lanes (annotation lane, then kernel lane, then the next stream), and
+`A`/`D` step through whichever lane is selected. When you switch lanes the
+selection jumps to the item nearest in time, so you stay in the same region of
+the timeline. Search spans both kernels and annotations.
 
-The bottom panel shows full details for the selected kernel: name, stream,
-device, start/end/duration, grid/block dimensions, shared memory, registers per
-thread, and correlation id.
+The bottom panel shows full details for the selected item — a kernel (name,
+stream, device, start/end/duration, grid/block dimensions, shared memory,
+registers per thread, correlation id) or an annotation (name, stream, timing).
 
 Zoom operates on a shared time window across **all** streams — when you zoom in
 on a busy stream, other lanes show what they were doing in that same time slice

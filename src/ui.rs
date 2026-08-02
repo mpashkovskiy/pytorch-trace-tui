@@ -39,6 +39,11 @@ pub fn render(frame: &mut Frame, app: &App) {
 }
 
 fn render_header(frame: &mut Frame, area: Rect, app: &App) {
+    let lane_kind = if app.active_lane_is_annotations() {
+        "annotations"
+    } else {
+        "kernels"
+    };
     let line = Line::from(vec![
         Span::styled(" GPU Trace Viewer ", Style::new().fg(Color::Black).bg(Color::Cyan).bold()),
         Span::raw("  "),
@@ -47,23 +52,19 @@ fn render_header(frame: &mut Frame, area: Rect, app: &App) {
             format!("cuda:{}", app.active_stream()),
             Style::new().fg(Color::Yellow).bold(),
         ),
-        Span::styled(
-            format!(" ({}/{})", app.active_stream_idx + 1, app.streams.len()),
-            Style::new().fg(Color::DarkGray),
-        ),
         Span::raw("  "),
-        Span::styled("Kernels: ", Style::new().fg(Color::DarkGray)),
+        Span::styled("Lane: ", Style::new().fg(Color::DarkGray)),
         Span::styled(
-            format!("{}", app.filtered_indices.len()),
-            Style::new().fg(Color::Green),
+            format!("{} ({}/{})", lane_kind, app.active_lane + 1, app.lanes.len()),
+            Style::new().fg(Color::Cyan),
         ),
         Span::raw("  "),
         Span::styled("Sel: ", Style::new().fg(Color::DarkGray)),
         Span::styled(
-            if app.filtered_indices.is_empty() {
+            if app.active_lane_len() == 0 {
                 "-/-".to_string()
             } else {
-                format!("{}/{}", app.selected_kernel + 1, app.filtered_indices.len())
+                format!("{}/{}", app.selected_item + 1, app.active_lane_len())
             },
             Style::new().fg(Color::Yellow),
         ),
@@ -71,7 +72,7 @@ fn render_header(frame: &mut Frame, area: Rect, app: &App) {
         Span::styled("Zoom: ", Style::new().fg(Color::DarkGray)),
         Span::styled(app.zoom_label(), Style::new().fg(Color::Magenta).bold()),
         Span::styled(
-            "  [/] search  [Tab/S-Tab] stream  [A/D] kernel  [W/S] zoom  [Q] quit",
+            "  [/] search  [Tab/S-Tab] lane  [A/D] item  [W/S] zoom  [Q] quit",
             Style::new().fg(Color::DarkGray),
         ),
     ]);
@@ -125,35 +126,20 @@ fn render_lane(frame: &mut Frame, area: Rect, app: &App) {
     let mut lines: Vec<Line> = Vec::new();
 
     let visible_rows = inner.height as usize;
-    let start = app.stream_view_offset.min(app.streams.len().saturating_sub(1));
+    let start = app.lane_view_offset.min(app.lanes.len().saturating_sub(1));
+    let end = (start + visible_rows).min(app.lanes.len());
 
-    let mut rows_used = 0usize;
-    for stream_idx in start..app.streams.len() {
-        let stream_id = app.streams[stream_idx];
-        let is_active = stream_idx == app.active_stream_idx;
+    for lane_idx in start..end {
+        let lane = &app.lanes[lane_idx];
+        let is_active_lane = lane_idx == app.active_lane;
 
-        let ann_indices = app.annotation_indices_for_stream(stream_id);
-        let rows_needed = if ann_indices.is_empty() { 1 } else { 2 };
-        if rows_used + rows_needed > visible_rows {
-            break;
-        }
-
-        if !ann_indices.is_empty() {
-            let ann_label = pad_to(String::new(), label_width - 1);
-            let mut ann_spans: Vec<Span<'static>> = vec![
-                Span::styled(ann_label, Style::new()),
-                Span::styled("│", Style::new().fg(Color::DarkGray)),
-            ];
-            ann_spans.extend(build_annotation_lane(
-                app, stream_idx, ts_start, time_span, lane_width,
-            ));
-            lines.push(Line::from(ann_spans));
-            rows_used += 1;
-        }
-
-        let label = format!("cuda:{}", stream_id);
+        let label = if lane.is_annotations() {
+            String::new()
+        } else {
+            format!("cuda:{}", lane.stream_id())
+        };
         let label_padded = pad_to(label, label_width - 1);
-        let label_style = if is_active {
+        let label_style = if is_active_lane {
             Style::new().fg(Color::Yellow).bold()
         } else {
             Style::new().fg(Color::DarkGray)
@@ -163,9 +149,8 @@ fn render_lane(frame: &mut Frame, area: Rect, app: &App) {
             Span::styled(label_padded, label_style),
             Span::styled("│", Style::new().fg(Color::DarkGray)),
         ];
-        spans.extend(build_stream_lane(app, stream_idx, ts_start, time_span, lane_width));
+        spans.extend(build_lane(app, lane_idx, ts_start, time_span, lane_width));
         lines.push(Line::from(spans));
-        rows_used += 1;
     }
 
     frame.render_widget(Paragraph::new(lines), inner);
@@ -181,9 +166,9 @@ fn stream_label_width(app: &App) -> usize {
     max + 2
 }
 
-fn build_stream_lane(
+fn build_lane(
     app: &App,
-    stream_idx: usize,
+    lane_idx: usize,
     ts_start: f64,
     time_span: f64,
     width: usize,
@@ -191,99 +176,63 @@ fn build_stream_lane(
     let mut spans: Vec<Span<'static>> = Vec::new();
     let mut cursor: usize = 0;
 
-    let stream_id = app.streams[stream_idx];
-    let is_active_stream = stream_idx == app.active_stream_idx;
-    let kernel_indices = app.kernel_indices_for_stream(stream_id);
-
-    let ts_end = ts_start + time_span;
-
-    for (list_idx, &kernel_idx) in kernel_indices.iter().enumerate() {
-        let k = &app.kernels[kernel_idx];
-        let is_selected = is_active_stream && list_idx == app.selected_kernel;
-
-        let Some((k_start_col, k_end_col)) =
-            crate::app::kernel_columns(k.ts, k.end_ts(), ts_start, ts_end, width)
-        else {
-            continue;
-        };
-
-        if k_start_col > cursor {
-            spans.push(Span::styled(
-                " ".repeat(k_start_col - cursor),
-                Style::new().bg(Color::Black),
-            ));
-        }
-
-        let block_width = k_end_col.saturating_sub(k_start_col).max(1);
-        let bg = kernel_color(k.cat.as_str(), list_idx);
-        let label = pad_to(ellipsize(&k.name, block_width), block_width);
-
-        let style = if is_selected {
-            Style::new().fg(Color::Black).bg(Color::White)
-        } else {
-            Style::new().fg(Color::Black).bg(bg)
-        };
-
-        spans.push(Span::styled(label, style));
-        cursor = k_end_col;
-    }
-
-    if cursor < width {
-        spans.push(Span::styled(
-            " ".repeat(width - cursor),
-            Style::new().bg(Color::Black),
-        ));
-    }
-
-    spans
-}
-
-fn build_annotation_lane(
-    app: &App,
-    stream_idx: usize,
-    ts_start: f64,
-    time_span: f64,
-    width: usize,
-) -> Vec<Span<'static>> {
-    let mut spans: Vec<Span<'static>> = Vec::new();
-    let mut cursor: usize = 0;
-
-    let stream_id = app.streams[stream_idx];
-    let indices = app.annotation_indices_for_stream(stream_id);
-
+    let lane = &app.lanes[lane_idx];
+    let is_active_lane = lane_idx == app.active_lane;
     let ts_end = ts_start + time_span;
     let ann_bg = Color::Rgb(90, 90, 110);
 
-    for &ann_idx in indices.iter() {
-        let a = &app.annotations[ann_idx];
+    for (pos, &item_idx) in lane.item_indices().iter().enumerate() {
+        let (name, ts, end_ts, block_bg) = match lane {
+            crate::app::Lane::Kernels { .. } => {
+                let k = &app.kernels[item_idx];
+                (
+                    k.name.as_str(),
+                    k.ts,
+                    k.end_ts(),
+                    kernel_color(k.cat.as_str(), pos),
+                )
+            }
+            crate::app::Lane::Annotations { .. } => {
+                let a = &app.annotations[item_idx];
+                (a.name.as_str(), a.ts, a.end_ts(), ann_bg)
+            }
+        };
 
-        let Some((a_start_col, a_end_col)) =
-            crate::app::kernel_columns(a.ts, a.end_ts(), ts_start, ts_end, width)
+        let is_selected = is_active_lane && pos == app.selected_item;
+
+        let Some((start_col, end_col)) =
+            crate::app::kernel_columns(ts, end_ts, ts_start, ts_end, width)
         else {
             continue;
         };
 
-        // Clamp to cursor: sub-column annotations must not each steal a full
-        // column, or cumulative drift pushes later annotations off the lane.
-        let a_start_col = a_start_col.max(cursor);
-        if a_start_col >= a_end_col || a_start_col >= width {
+        // Clamp to cursor so sub-column items don't each steal a full column and
+        // push later items off the lane.
+        let start_col = start_col.max(cursor);
+        if start_col >= end_col || start_col >= width {
             continue;
         }
 
-        if a_start_col > cursor {
+        if start_col > cursor {
             spans.push(Span::styled(
-                " ".repeat(a_start_col - cursor),
+                " ".repeat(start_col - cursor),
                 Style::new().bg(Color::Black),
             ));
         }
 
-        let block_width = a_end_col.saturating_sub(a_start_col).max(1);
-        let label = pad_to(ellipsize(&a.name, block_width), block_width);
+        let block_width = end_col.saturating_sub(start_col).max(1);
+        let label = pad_to(ellipsize(name, block_width), block_width);
 
-        let style = Style::new().fg(Color::White).bg(ann_bg);
+        let style = if is_selected {
+            Style::new().fg(Color::Black).bg(Color::White)
+        } else if lane.is_annotations() {
+            Style::new().fg(Color::White).bg(block_bg)
+        } else {
+            Style::new().fg(Color::Black).bg(block_bg)
+        };
 
         spans.push(Span::styled(label, style));
-        cursor = a_end_col;
+        cursor = end_col;
     }
 
     if cursor < width {
@@ -297,72 +246,101 @@ fn build_annotation_lane(
 }
 
 fn render_info_panel(frame: &mut Frame, area: Rect, app: &App) {
+    let is_annotation = app.active_lane_is_annotations();
+    let title = if is_annotation {
+        " Annotation Info "
+    } else {
+        " Kernel Info "
+    };
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(Style::new().fg(Color::Yellow))
-        .title(" Kernel Info ")
+        .title(title)
         .title_style(Style::new().fg(Color::Yellow).bold());
 
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    let Some(k) = app.selected_event() else {
+    use crate::app::SelectedTraceItem;
+    let Some(item) = app.selected_trace_item() else {
         frame.render_widget(
-            Paragraph::new("No kernel selected").style(Style::new().fg(Color::DarkGray)),
+            Paragraph::new("No item selected").style(Style::new().fg(Color::DarkGray)),
             inner,
         );
         return;
     };
 
-    let na = || "N/A".to_string();
-
-    let lines: Vec<Line> = vec![
-        Line::from(vec![
-            kv_label("Name: "),
-            kv_value(&k.name),
-            Span::raw("  "),
-            kv_label("Cat: "),
-            kv_value(&k.cat),
-        ]),
-        Line::from(vec![
-            kv_label("Stream: "),
-            kv_value(&format!("cuda:{}", k.stream)),
-            Span::raw("  "),
-            kv_label("Device: "),
-            kv_value(&format!("{}", k.device)),
-        ]),
-        Line::from(vec![
-            kv_label("Start: "),
-            kv_value(&format!("{:.3} μs", k.ts)),
-            Span::raw("  "),
-            kv_label("End: "),
-            kv_value(&format!("{:.3} μs", k.end_ts())),
-            Span::raw("  "),
-            kv_label("Dur: "),
-            kv_value(&format!("{:.3} μs", k.dur)),
-        ]),
-        Line::from(vec![
-            kv_label("Grid: "),
-            kv_value(&k.grid.clone().unwrap_or_else(na)),
-            Span::raw("  "),
-            kv_label("Block: "),
-            kv_value(&k.block.clone().unwrap_or_else(na)),
-        ]),
-        Line::from(vec![
-            kv_label("Shared Mem: "),
-            kv_value(&k.shared_memory.map_or_else(na, |v| format!("{} B", v))),
-            Span::raw("  "),
-            kv_label("Regs/Thread: "),
-            kv_value(&k.registers_per_thread.map_or_else(na, |v| v.to_string())),
-        ]),
-        Line::from(vec![
-            kv_label("Correlation: "),
-            kv_value(&k.correlation.map_or_else(na, |v| v.to_string())),
-        ]),
-    ];
-
-    frame.render_widget(Paragraph::new(lines), inner);
+    match item {
+        SelectedTraceItem::Annotation(a) => {
+            let lines: Vec<Line> = vec![
+                Line::from(vec![kv_label("Name: "), kv_value(&a.name)]),
+                Line::from(vec![
+                    kv_label("Stream: "),
+                    kv_value(&format!("cuda:{}", a.stream)),
+                ]),
+                Line::from(vec![
+                    kv_label("Start: "),
+                    kv_value(&format!("{:.3} μs", a.ts)),
+                    Span::raw("  "),
+                    kv_label("End: "),
+                    kv_value(&format!("{:.3} μs", a.end_ts())),
+                    Span::raw("  "),
+                    kv_label("Dur: "),
+                    kv_value(&format!("{:.3} μs", a.dur)),
+                ]),
+            ];
+            frame.render_widget(Paragraph::new(lines), inner);
+        }
+        SelectedTraceItem::Kernel(k) => {
+            let na = || "N/A".to_string();
+            let lines: Vec<Line> = vec![
+                Line::from(vec![
+                    kv_label("Name: "),
+                    kv_value(&k.name),
+                    Span::raw("  "),
+                    kv_label("Cat: "),
+                    kv_value(&k.cat),
+                ]),
+                Line::from(vec![
+                    kv_label("Stream: "),
+                    kv_value(&format!("cuda:{}", k.stream)),
+                    Span::raw("  "),
+                    kv_label("Device: "),
+                    kv_value(&format!("{}", k.device)),
+                ]),
+                Line::from(vec![
+                    kv_label("Start: "),
+                    kv_value(&format!("{:.3} μs", k.ts)),
+                    Span::raw("  "),
+                    kv_label("End: "),
+                    kv_value(&format!("{:.3} μs", k.end_ts())),
+                    Span::raw("  "),
+                    kv_label("Dur: "),
+                    kv_value(&format!("{:.3} μs", k.dur)),
+                ]),
+                Line::from(vec![
+                    kv_label("Grid: "),
+                    kv_value(&k.grid.clone().unwrap_or_else(na)),
+                    Span::raw("  "),
+                    kv_label("Block: "),
+                    kv_value(&k.block.clone().unwrap_or_else(na)),
+                ]),
+                Line::from(vec![
+                    kv_label("Shared Mem: "),
+                    kv_value(&k.shared_memory.map_or_else(na, |v| format!("{} B", v))),
+                    Span::raw("  "),
+                    kv_label("Regs/Thread: "),
+                    kv_value(&k.registers_per_thread.map_or_else(na, |v| v.to_string())),
+                ]),
+                Line::from(vec![
+                    kv_label("Correlation: "),
+                    kv_value(&k.correlation.map_or_else(na, |v| v.to_string())),
+                ]),
+            ];
+            frame.render_widget(Paragraph::new(lines), inner);
+        }
+    }
 }
 
 fn kernel_color(cat: &str, idx: usize) -> Color {

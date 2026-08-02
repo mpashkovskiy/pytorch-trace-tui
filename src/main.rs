@@ -199,7 +199,7 @@ fn event_loop(
     loop {
         let term_height = terminal.size()?.height as usize;
         let lane_rows = term_height.saturating_sub(1 + 12 + 3);
-        app.ensure_active_stream_visible(lane_rows.max(1));
+        app.ensure_active_lane_visible(lane_rows.max(1));
 
         terminal.draw(|frame| {
             ui::render(frame, app);
@@ -224,10 +224,10 @@ fn event_loop(
                             app.search_start();
                         }
                         KeyCode::Char('a') | KeyCode::Char('A') | KeyCode::Left => {
-                            app.prev_kernel();
+                            app.prev_item();
                         }
                         KeyCode::Char('d') | KeyCode::Char('D') | KeyCode::Right => {
-                            app.next_kernel();
+                            app.next_item();
                         }
                         KeyCode::Char('w') | KeyCode::Char('W') | KeyCode::Up => {
                             app.zoom_in();
@@ -236,10 +236,10 @@ fn event_loop(
                             app.zoom_out();
                         }
                         KeyCode::Tab => {
-                            app.next_stream();
+                            app.next_lane();
                         }
                         KeyCode::BackTab => {
-                            app.prev_stream();
+                            app.prev_lane();
                         }
                         _ => {}
                     }

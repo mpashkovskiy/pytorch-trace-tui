@@ -3,17 +3,73 @@ use crate::trace::{AnnotationEvent, KernelEvent, Trace};
 const ZOOM_MIN: f64 = 0.1;
 const ZOOM_FACTOR: f64 = 1.5;
 
+/// A single navigable row on the timeline. Every lane — whether it holds GPU
+/// kernels or user annotations — behaves identically for navigation.
+#[derive(Debug, Clone)]
+pub enum Lane {
+    Kernels {
+        stream_id: u64,
+        item_indices: Vec<usize>,
+    },
+    Annotations {
+        stream_id: u64,
+        item_indices: Vec<usize>,
+    },
+}
+
+impl Lane {
+    pub fn stream_id(&self) -> u64 {
+        match self {
+            Lane::Kernels { stream_id, .. } | Lane::Annotations { stream_id, .. } => *stream_id,
+        }
+    }
+
+    pub fn item_indices(&self) -> &[usize] {
+        match self {
+            Lane::Kernels { item_indices, .. } | Lane::Annotations { item_indices, .. } => {
+                item_indices
+            }
+        }
+    }
+
+    pub fn is_annotations(&self) -> bool {
+        matches!(self, Lane::Annotations { .. })
+    }
+}
+
+/// The currently selected item in the active lane, either a kernel or an annotation.
+#[derive(Debug, Clone, Copy)]
+pub enum SelectedTraceItem<'a> {
+    Kernel(&'a KernelEvent),
+    Annotation(&'a AnnotationEvent),
+}
+
+impl SelectedTraceItem<'_> {
+    pub fn ts(&self) -> f64 {
+        match self {
+            SelectedTraceItem::Kernel(k) => k.ts,
+            SelectedTraceItem::Annotation(a) => a.ts,
+        }
+    }
+
+    pub fn dur(&self) -> f64 {
+        match self {
+            SelectedTraceItem::Kernel(k) => k.dur,
+            SelectedTraceItem::Annotation(a) => a.dur,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct App {
     pub kernels: Vec<KernelEvent>,
     pub annotations: Vec<AnnotationEvent>,
     pub streams: Vec<u64>,
-    pub active_stream_idx: usize,
-    pub filtered_indices: Vec<usize>,
-    pub selected_kernel: usize,
+    pub lanes: Vec<Lane>,
+    pub active_lane: usize,
+    pub selected_item: usize,
     pub zoom_level: f64,
-    pub view_offset: usize,
-    pub stream_view_offset: usize,
+    pub lane_view_offset: usize,
     pub search_active: bool,
     pub search_query: String,
     pub search_no_match: bool,
@@ -23,97 +79,151 @@ impl App {
     pub fn new(trace: Trace) -> Self {
         let kernels = trace.kernels;
         let annotations = trace.annotations;
-        // Collect unique streams
-        let mut streams: Vec<u64> = {
-            let mut s: Vec<u64> = kernels.iter().map(|k| k.stream).collect();
-            s.sort_unstable();
-            s.dedup();
-            s
-        };
+
+        // Streams come from BOTH kernels and annotations so annotation-only
+        // streams are never dropped.
+        let mut streams: Vec<u64> = kernels
+            .iter()
+            .map(|k| k.stream)
+            .chain(annotations.iter().map(|a| a.stream))
+            .collect();
+        streams.sort_unstable();
+        streams.dedup();
         if streams.is_empty() {
             streams.push(0);
         }
+
+        let lanes = build_lanes(&kernels, &annotations, &streams);
 
         let mut app = App {
             kernels,
             annotations,
             streams,
-            active_stream_idx: 0,
-            filtered_indices: vec![],
-            selected_kernel: 0,
+            lanes,
+            active_lane: 0,
+            selected_item: 0,
             zoom_level: 1.0,
-            view_offset: 0,
-            stream_view_offset: 0,
+            lane_view_offset: 0,
             search_active: false,
             search_query: String::new(),
             search_no_match: false,
         };
-        app.rebuild_filter();
+        app.clamp_selected_item();
         app
     }
 
-    pub fn rebuild_filter(&mut self) {
-        let stream_id = self.active_stream();
-        self.filtered_indices = self
-            .kernels
-            .iter()
-            .enumerate()
-            .filter(|(_, k)| k.stream == stream_id)
-            .map(|(i, _)| i)
-            .collect();
-        if self.filtered_indices.is_empty() {
-            self.selected_kernel = 0;
-        } else {
-            self.selected_kernel = self.selected_kernel.min(self.filtered_indices.len() - 1);
+    fn clamp_selected_item(&mut self) {
+        let len = self.active_lane_len();
+        if len == 0 {
+            self.selected_item = 0;
+        } else if self.selected_item >= len {
+            self.selected_item = len - 1;
         }
-        self.view_offset = 0;
     }
 
+    pub fn active_lane_len(&self) -> usize {
+        self.lanes
+            .get(self.active_lane)
+            .map(|l| l.item_indices().len())
+            .unwrap_or(0)
+    }
+
+    /// Stream id of the active lane (used for the header/label).
     pub fn active_stream(&self) -> u64 {
-        self.streams[self.active_stream_idx]
+        self.lanes
+            .get(self.active_lane)
+            .map(|l| l.stream_id())
+            .unwrap_or_else(|| self.streams.first().copied().unwrap_or(0))
     }
 
-    pub fn kernel_indices_for_stream(&self, stream_id: u64) -> Vec<usize> {
-        self.kernels
-            .iter()
-            .enumerate()
-            .filter(|(_, k)| k.stream == stream_id)
-            .map(|(i, _)| i)
-            .collect()
+    pub fn active_lane_is_annotations(&self) -> bool {
+        self.lanes
+            .get(self.active_lane)
+            .map(|l| l.is_annotations())
+            .unwrap_or(false)
     }
 
-    pub fn selected_event(&self) -> Option<&KernelEvent> {
-        let idx = *self.filtered_indices.get(self.selected_kernel)?;
-        self.kernels.get(idx)
+    /// ts of the item at position `pos` within the given lane, if any.
+    fn item_ts(&self, lane: &Lane, pos: usize) -> Option<f64> {
+        let idx = *lane.item_indices().get(pos)?;
+        match lane {
+            Lane::Kernels { .. } => self.kernels.get(idx).map(|k| k.ts),
+            Lane::Annotations { .. } => self.annotations.get(idx).map(|a| a.ts),
+        }
     }
 
-    pub fn annotation_indices_for_stream(&self, stream_id: u64) -> Vec<usize> {
-        self.annotations
-            .iter()
-            .enumerate()
-            .filter(|(_, a)| a.stream == stream_id)
-            .map(|(i, _)| i)
-            .collect()
+    pub fn selected_trace_item(&self) -> Option<SelectedTraceItem<'_>> {
+        let lane = self.lanes.get(self.active_lane)?;
+        let idx = *lane.item_indices().get(self.selected_item)?;
+        match lane {
+            Lane::Kernels { .. } => self.kernels.get(idx).map(SelectedTraceItem::Kernel),
+            Lane::Annotations { .. } => {
+                self.annotations.get(idx).map(SelectedTraceItem::Annotation)
+            }
+        }
     }
 
-    pub fn prev_kernel(&mut self) {
-        if self.filtered_indices.is_empty() {
+    // ── Item navigation (A/D) — no wrap, matches previous kernel navigation ──
+
+    pub fn prev_item(&mut self) {
+        if self.selected_item > 0 {
+            self.selected_item -= 1;
+        }
+    }
+
+    pub fn next_item(&mut self) {
+        if self.selected_item + 1 < self.active_lane_len() {
+            self.selected_item += 1;
+        }
+    }
+
+    // ── Lane navigation (Tab / Shift+Tab) — wraps, picks nearest-ts item ─────
+
+    pub fn next_lane(&mut self) {
+        if self.lanes.len() <= 1 {
             return;
         }
-        if self.selected_kernel > 0 {
-            self.selected_kernel -= 1;
-        }
-        self.clamp_view_offset();
+        let target = (self.active_lane + 1) % self.lanes.len();
+        self.move_to_lane(target);
     }
 
-    pub fn next_kernel(&mut self) {
-        if self.filtered_indices.is_empty() {
+    pub fn prev_lane(&mut self) {
+        if self.lanes.len() <= 1 {
             return;
         }
-        if self.selected_kernel + 1 < self.filtered_indices.len() {
-            self.selected_kernel += 1;
+        let target = (self.active_lane + self.lanes.len() - 1) % self.lanes.len();
+        self.move_to_lane(target);
+    }
+
+    fn move_to_lane(&mut self, target: usize) {
+        let prev_ts = self.selected_trace_item().map(|i| i.ts());
+        self.active_lane = target;
+        self.selected_item = match prev_ts {
+            Some(ts) => self.nearest_item_in_active_lane(ts),
+            None => 0,
+        };
+    }
+
+    fn nearest_item_in_active_lane(&self, target_ts: f64) -> usize {
+        let Some(lane) = self.lanes.get(self.active_lane) else {
+            return 0;
+        };
+        let n = lane.item_indices().len();
+        if n == 0 {
+            return 0;
         }
-        self.clamp_view_offset();
+        let mut best = 0usize;
+        let mut best_diff = f64::MAX;
+        for pos in 0..n {
+            if let Some(ts) = self.item_ts(lane, pos) {
+                let diff = (ts - target_ts).abs();
+                if diff < best_diff {
+                    best_diff = diff;
+                    best = pos;
+                }
+            }
+        }
+        best
     }
 
     pub fn zoom_in(&mut self) {
@@ -124,22 +234,7 @@ impl App {
         self.zoom_level = (self.zoom_level / ZOOM_FACTOR).max(ZOOM_MIN);
     }
 
-    pub fn next_stream(&mut self) {
-        if self.streams.len() <= 1 {
-            return;
-        }
-        self.active_stream_idx = (self.active_stream_idx + 1) % self.streams.len();
-        self.rebuild_filter();
-    }
-
-    pub fn prev_stream(&mut self) {
-        if self.streams.len() <= 1 {
-            return;
-        }
-        self.active_stream_idx =
-            (self.active_stream_idx + self.streams.len() - 1) % self.streams.len();
-        self.rebuild_filter();
-    }
+    // ── Search over BOTH lane kinds ──────────────────────────────────────────
 
     pub fn search_start(&mut self) {
         self.search_active = true;
@@ -174,63 +269,36 @@ impl App {
         }
         let needle = self.search_query.to_lowercase();
 
-        for (s_idx, &stream_id) in self.streams.iter().enumerate() {
-            let indices = self.kernel_indices_for_stream(stream_id);
-            for (list_idx, &kernel_idx) in indices.iter().enumerate() {
-                if self.kernels[kernel_idx]
-                    .name
-                    .to_lowercase()
-                    .contains(&needle)
-                {
-                    self.active_stream_idx = s_idx;
-                    self.rebuild_filter();
-                    self.selected_kernel = list_idx.min(self.filtered_indices.len().saturating_sub(1));
-                    self.search_no_match = false;
-                    return;
+        for lane_idx in 0..self.lanes.len() {
+            let lane = &self.lanes[lane_idx];
+            for (pos, &item_idx) in lane.item_indices().iter().enumerate() {
+                let name = match lane {
+                    Lane::Kernels { .. } => self.kernels.get(item_idx).map(|k| &k.name),
+                    Lane::Annotations { .. } => self.annotations.get(item_idx).map(|a| &a.name),
+                };
+                if let Some(name) = name {
+                    if name.to_lowercase().contains(&needle) {
+                        self.active_lane = lane_idx;
+                        self.selected_item = pos;
+                        self.search_no_match = false;
+                        return;
+                    }
                 }
             }
         }
         self.search_no_match = true;
     }
 
-    pub fn rows_for_stream(&self, stream_idx: usize) -> usize {
-        let stream_id = self.streams[stream_idx];
-        if self.annotations.iter().any(|a| a.stream == stream_id) {
-            2
-        } else {
-            1
-        }
-    }
+    // ── Vertical scroll — one lane == one rendered row ───────────────────────
 
-    pub fn ensure_active_stream_visible(&mut self, visible_rows: usize) {
+    pub fn ensure_active_lane_visible(&mut self, visible_rows: usize) {
         if visible_rows == 0 {
             return;
         }
-        if self.active_stream_idx < self.stream_view_offset {
-            self.stream_view_offset = self.active_stream_idx;
-            return;
-        }
-        loop {
-            let mut used = 0usize;
-            let mut last_fit = self.stream_view_offset;
-            for idx in self.stream_view_offset..self.streams.len() {
-                let need = self.rows_for_stream(idx);
-                if used + need > visible_rows {
-                    break;
-                }
-                used += need;
-                last_fit = idx;
-            }
-            if self.active_stream_idx <= last_fit {
-                break;
-            }
-            self.stream_view_offset += 1;
-        }
-    }
-
-    fn clamp_view_offset(&mut self) {
-        if self.selected_kernel < self.view_offset {
-            self.view_offset = self.selected_kernel;
+        if self.active_lane < self.lane_view_offset {
+            self.lane_view_offset = self.active_lane;
+        } else if self.active_lane >= self.lane_view_offset + visible_rows {
+            self.lane_view_offset = self.active_lane + 1 - visible_rows;
         }
     }
 
@@ -240,6 +308,10 @@ impl App {
         for k in &self.kernels {
             min_start = min_start.min(k.ts);
             max_end = max_end.max(k.end_ts());
+        }
+        for a in &self.annotations {
+            min_start = min_start.min(a.ts);
+            max_end = max_end.max(a.end_ts());
         }
         if min_start > max_end {
             (0.0, 1.0)
@@ -254,8 +326,8 @@ impl App {
         let visible_span = (total_span / self.zoom_level).max(1e-3);
 
         let center = self
-            .selected_event()
-            .map(|k| k.ts + k.dur / 2.0)
+            .selected_trace_item()
+            .map(|i| i.ts() + i.dur() / 2.0)
             .unwrap_or(g_start + total_span / 2.0);
 
         let ts_start = (center - visible_span / 2.0).max(g_start);
@@ -271,6 +343,64 @@ impl App {
             format!("{:.1}x", z)
         }
     }
+}
+
+/// Build the flat, ordered lane list. For each stream (sorted) we emit its
+/// annotation lane first (if it has any annotations) then its kernel lane (if
+/// it has any kernels). Each lane's item indices are sorted by timestamp so
+/// left/right navigation maps to the timeline.
+fn build_lanes(
+    kernels: &[KernelEvent],
+    annotations: &[AnnotationEvent],
+    streams: &[u64],
+) -> Vec<Lane> {
+    let mut lanes = Vec::new();
+    for &stream_id in streams {
+        let mut ann: Vec<usize> = annotations
+            .iter()
+            .enumerate()
+            .filter(|(_, a)| a.stream == stream_id)
+            .map(|(i, _)| i)
+            .collect();
+        ann.sort_by(|&a, &b| {
+            annotations[a]
+                .ts
+                .partial_cmp(&annotations[b].ts)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        if !ann.is_empty() {
+            lanes.push(Lane::Annotations {
+                stream_id,
+                item_indices: ann,
+            });
+        }
+
+        let mut kern: Vec<usize> = kernels
+            .iter()
+            .enumerate()
+            .filter(|(_, k)| k.stream == stream_id)
+            .map(|(i, _)| i)
+            .collect();
+        kern.sort_by(|&a, &b| {
+            kernels[a]
+                .ts
+                .partial_cmp(&kernels[b].ts)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        if !kern.is_empty() {
+            lanes.push(Lane::Kernels {
+                stream_id,
+                item_indices: kern,
+            });
+        }
+    }
+    if lanes.is_empty() {
+        lanes.push(Lane::Kernels {
+            stream_id: streams.first().copied().unwrap_or(0),
+            item_indices: vec![],
+        });
+    }
+    lanes
 }
 
 pub fn kernel_columns(
@@ -323,6 +453,22 @@ mod tests {
         }
     }
 
+    fn named_kernel(stream: u64, ts: f64, name: &str) -> KernelEvent {
+        KernelEvent {
+            name: name.to_string(),
+            cat: "kernel".to_string(),
+            ts,
+            dur: 5.0,
+            device: 0,
+            stream,
+            grid: None,
+            block: None,
+            shared_memory: None,
+            registers_per_thread: None,
+            correlation: None,
+        }
+    }
+
     fn sample_app() -> App {
         let kernels = vec![
             make_kernel(7, 100.0, 10.0),
@@ -341,38 +487,67 @@ mod tests {
     }
 
     #[test]
-    fn test_filter_by_stream() {
-        let mut app = sample_app();
-        // First stream is 3
-        assert_eq!(app.active_stream(), 3);
-        assert_eq!(app.filtered_indices.len(), 2);
-
-        app.next_stream();
-        assert_eq!(app.active_stream(), 7);
-        assert_eq!(app.filtered_indices.len(), 3);
+    fn test_lanes_kernel_only() {
+        // Two streams, no annotations → two kernel lanes, stream 3 first.
+        let app = sample_app();
+        assert_eq!(app.lanes.len(), 2);
+        assert_eq!(app.lanes[0].stream_id(), 3);
+        assert!(!app.lanes[0].is_annotations());
+        assert_eq!(app.lanes[0].item_indices().len(), 2);
+        assert_eq!(app.lanes[1].stream_id(), 7);
+        assert_eq!(app.lanes[1].item_indices().len(), 3);
     }
+
+    #[test]
+    fn test_active_lane_is_first() {
+        let app = sample_app();
+        assert_eq!(app.active_lane, 0);
+        assert_eq!(app.active_stream(), 3);
+        assert_eq!(app.active_lane_len(), 2);
+    }
+
+    // ── S3 regression: pure-kernel navigation identical to before ────────────
 
     #[test]
     fn test_navigation_ad() {
         let mut app = sample_app();
-        app.next_stream(); // go to stream 7 (3 kernels)
-        assert_eq!(app.selected_kernel, 0);
+        app.next_lane(); // go to stream 7 kernel lane (3 kernels)
+        assert_eq!(app.active_stream(), 7);
+        assert_eq!(app.selected_item, 0);
 
-        app.next_kernel();
-        assert_eq!(app.selected_kernel, 1);
-        app.next_kernel();
-        assert_eq!(app.selected_kernel, 2);
-        // Can't go past last
-        app.next_kernel();
-        assert_eq!(app.selected_kernel, 2);
+        app.next_item();
+        assert_eq!(app.selected_item, 1);
+        app.next_item();
+        assert_eq!(app.selected_item, 2);
+        app.next_item(); // clamps
+        assert_eq!(app.selected_item, 2);
 
-        app.prev_kernel();
-        assert_eq!(app.selected_kernel, 1);
-        app.prev_kernel();
-        assert_eq!(app.selected_kernel, 0);
-        // Can't go before first
-        app.prev_kernel();
-        assert_eq!(app.selected_kernel, 0);
+        app.prev_item();
+        assert_eq!(app.selected_item, 1);
+        app.prev_item();
+        assert_eq!(app.selected_item, 0);
+        app.prev_item(); // clamps
+        assert_eq!(app.selected_item, 0);
+    }
+
+    #[test]
+    fn test_lane_wraps() {
+        let mut app = sample_app();
+        app.next_lane();
+        app.next_lane(); // wraps back to first lane
+        assert_eq!(app.active_lane, 0);
+    }
+
+    #[test]
+    fn test_prev_lane_wraps() {
+        let mut app = sample_app();
+        assert_eq!(app.active_lane, 0);
+        app.prev_lane(); // wraps to last lane
+        assert_eq!(app.active_lane, app.lanes.len() - 1);
+        app.prev_lane();
+        assert_eq!(app.active_lane, app.lanes.len() - 2);
+        app.next_lane();
+        assert_eq!(app.active_lane, app.lanes.len() - 1);
     }
 
     #[test]
@@ -384,7 +559,6 @@ mod tests {
         app.zoom_out();
         app.zoom_out();
         assert!(app.zoom_level < initial);
-        // Clamp at min
         for _ in 0..100 {
             app.zoom_out();
         }
@@ -392,85 +566,13 @@ mod tests {
     }
 
     #[test]
-    fn test_tab_wraps() {
+    fn test_zoom_in_unbounded() {
         let mut app = sample_app();
-        app.next_stream();
-        app.next_stream(); // wraps back to first
-        assert_eq!(app.active_stream_idx, 0);
-    }
-
-    #[test]
-    fn test_prev_stream_wraps() {
-        let mut app = sample_app();
-        assert_eq!(app.active_stream_idx, 0);
-        app.prev_stream(); // wraps to last
-        assert_eq!(app.active_stream_idx, app.streams.len() - 1);
-        app.prev_stream();
-        assert_eq!(app.active_stream_idx, app.streams.len() - 2);
-        app.next_stream();
-        assert_eq!(app.active_stream_idx, app.streams.len() - 1);
-    }
-
-    #[test]
-    fn test_kernel_indices_for_stream() {
-        let app = sample_app();
-        let s7 = app.kernel_indices_for_stream(7);
-        let s3 = app.kernel_indices_for_stream(3);
-        assert_eq!(s7.len(), 3);
-        assert_eq!(s3.len(), 2);
-    }
-
-    #[test]
-    fn test_stream_scroll_keeps_active_visible() {
-        let kernels = vec![
-            make_kernel(1, 0.0, 1.0),
-            make_kernel(2, 0.0, 1.0),
-            make_kernel(3, 0.0, 1.0),
-            make_kernel(4, 0.0, 1.0),
-        ];
-        let mut app = app_from(kernels);
-        assert_eq!(app.streams, vec![1, 2, 3, 4]);
-
-        let visible_rows = 2;
-        app.ensure_active_stream_visible(visible_rows);
-        assert_eq!(app.stream_view_offset, 0);
-
-        app.next_stream();
-        app.next_stream();
-        app.ensure_active_stream_visible(visible_rows);
-        assert_eq!(app.active_stream_idx, 2);
-        assert_eq!(app.stream_view_offset, 1);
-
-        app.next_stream();
-        app.ensure_active_stream_visible(visible_rows);
-        assert_eq!(app.stream_view_offset, 2);
-    }
-
-    #[test]
-    fn test_scroll_accounts_for_annotation_rows() {
-        let kernels = vec![
-            make_kernel(1, 0.0, 1.0),
-            make_kernel(2, 0.0, 1.0),
-            make_kernel(3, 0.0, 1.0),
-        ];
-        let annotations = vec![AnnotationEvent {
-            name: "ctx".to_string(),
-            ts: 0.0,
-            dur: 1.0,
-            stream: 2,
-        }];
-        let mut app = App::new(Trace { kernels, annotations });
-        assert_eq!(app.streams, vec![1, 2, 3]);
-        assert_eq!(app.rows_for_stream(0), 1);
-        assert_eq!(app.rows_for_stream(1), 2);
-        assert_eq!(app.rows_for_stream(2), 1);
-
-        let visible_rows = 3;
-        while app.active_stream_idx != 2 {
-            app.next_stream();
+        for _ in 0..200 {
+            app.zoom_in();
         }
-        app.ensure_active_stream_visible(visible_rows);
-        assert_eq!(app.stream_view_offset, 1);
+        assert!(app.zoom_level > 1e6);
+        assert!(app.zoom_level.is_finite());
     }
 
     #[test]
@@ -510,14 +612,264 @@ mod tests {
         assert!(s1 >= s0 && e1 <= e0);
     }
 
+    // ── S1 happy path: annotation lane is a first-class navigable lane ───────
+
+    fn app_with_annotations() -> App {
+        let kernels = vec![
+            named_kernel(4, 100.0, "kernel_a"),
+            named_kernel(4, 200.0, "kernel_b"),
+            named_kernel(4, 300.0, "kernel_c"),
+        ];
+        let annotations = vec![
+            AnnotationEvent { name: "ctx_0".to_string(), ts: 90.0, dur: 60.0, stream: 4 },
+            AnnotationEvent { name: "ctx_1".to_string(), ts: 180.0, dur: 40.0, stream: 4 },
+        ];
+        App::new(Trace { kernels, annotations })
+    }
+
     #[test]
-    fn test_zoom_in_unbounded() {
-        let mut app = sample_app();
-        for _ in 0..200 {
+    fn test_annotation_lane_before_kernel_lane() {
+        let app = app_with_annotations();
+        assert_eq!(app.lanes.len(), 2);
+        assert!(app.lanes[0].is_annotations());
+        assert_eq!(app.lanes[0].item_indices().len(), 2);
+        assert!(!app.lanes[1].is_annotations());
+        assert_eq!(app.lanes[1].item_indices().len(), 3);
+    }
+
+    #[test]
+    fn test_tab_from_kernel_lane_reaches_annotation_lane() {
+        // Lane order: [cuda:1 kernels] [cuda:4 annotations] [cuda:4 kernels].
+        let kernels = vec![
+            named_kernel(1, 10.0, "k1"),
+            named_kernel(4, 100.0, "k4"),
+        ];
+        let annotations = vec![AnnotationEvent {
+            name: "ctx".to_string(),
+            ts: 95.0,
+            dur: 20.0,
+            stream: 4,
+        }];
+        let mut app = App::new(Trace { kernels, annotations });
+        assert_eq!(app.lanes.len(), 3);
+
+        assert_eq!(app.active_lane, 0);
+        assert!(!app.active_lane_is_annotations());
+        assert_eq!(app.active_stream(), 1);
+
+        // Tab from a kernel lane must land on the annotation lane.
+        app.next_lane();
+        assert_eq!(app.active_lane, 1);
+        assert!(app.active_lane_is_annotations());
+        assert_eq!(app.active_stream(), 4);
+        match app.selected_trace_item().unwrap() {
+            SelectedTraceItem::Annotation(a) => assert_eq!(a.name, "ctx"),
+            _ => panic!("Tab must select the annotation lane"),
+        }
+    }
+
+    #[test]
+    fn test_tab_selects_annotation_lane_and_ad_navigates() {
+        let mut app = app_with_annotations();
+        // Active lane starts on the annotation lane (rendered first).
+        assert!(app.active_lane_is_annotations());
+        match app.selected_trace_item().unwrap() {
+            SelectedTraceItem::Annotation(a) => assert_eq!(a.name, "ctx_0"),
+            _ => panic!("expected annotation selected"),
+        }
+
+        // A/D moves within the annotation lane.
+        app.next_item();
+        match app.selected_trace_item().unwrap() {
+            SelectedTraceItem::Annotation(a) => assert_eq!(a.name, "ctx_1"),
+            _ => panic!("expected annotation selected"),
+        }
+        app.next_item(); // clamp
+        assert_eq!(app.selected_item, 1);
+
+        // Tab moves to the kernel lane of the same stream.
+        app.next_lane();
+        assert!(!app.active_lane_is_annotations());
+        assert!(matches!(
+            app.selected_trace_item().unwrap(),
+            SelectedTraceItem::Kernel(_)
+        ));
+    }
+
+    #[test]
+    fn test_lane_change_selects_nearest_ts() {
+        // Annotation ctx_1 at ts=180; nearest kernel is kernel_b at ts=200.
+        let mut app = app_with_annotations();
+        app.next_item(); // annotation ctx_1 (ts 180)
+        app.next_lane(); // kernel lane; should land near ts 180 → kernel_b (200)
+        match app.selected_trace_item().unwrap() {
+            SelectedTraceItem::Kernel(k) => assert_eq!(k.name, "kernel_b"),
+            _ => panic!("expected kernel selected"),
+        }
+    }
+
+    #[test]
+    fn test_zoom_center_follows_annotation() {
+        let mut app = app_with_annotations();
+        // Zoom in so the window is narrow enough to center on the selection
+        // (otherwise the window clamps to global bounds and skews the center).
+        for _ in 0..5 {
             app.zoom_in();
         }
-        assert!(app.zoom_level > 1e6);
-        assert!(app.zoom_level.is_finite());
+        let (s, e) = app.global_visible_window();
+        let center = (s + e) / 2.0;
+        assert!(
+            (center - 120.0).abs() < 20.0,
+            "expected window centered near annotation ctx_0 midpoint 120, got center={}",
+            center
+        );
+    }
+
+    // ── S2 edge: annotation-only stream survives; empty stream handling ──────
+
+    #[test]
+    fn test_annotation_only_stream_survives() {
+        let kernels = vec![named_kernel(1, 100.0, "k1")];
+        let annotations = vec![AnnotationEvent {
+            name: "solo".to_string(),
+            ts: 50.0,
+            dur: 10.0,
+            stream: 9,
+        }];
+        let app = App::new(Trace { kernels, annotations });
+        assert_eq!(app.streams, vec![1, 9]);
+        // Lanes: stream 1 kernel lane, stream 9 annotation lane.
+        assert_eq!(app.lanes.len(), 2);
+        assert!(app.lanes.iter().any(|l| l.stream_id() == 9 && l.is_annotations()));
+    }
+
+    #[test]
+    fn test_stream_without_annotations_is_single_lane() {
+        let kernels = vec![
+            named_kernel(1, 0.0, "a"),
+            named_kernel(2, 0.0, "b"),
+        ];
+        let annotations = vec![AnnotationEvent {
+            name: "ctx".to_string(),
+            ts: 0.0,
+            dur: 1.0,
+            stream: 2,
+        }];
+        let app = App::new(Trace { kernels, annotations });
+        // stream 1: 1 lane (kernels). stream 2: 2 lanes (annotations + kernels).
+        assert_eq!(app.lanes.len(), 3);
+        assert_eq!(app.lanes[0].stream_id(), 1);
+        assert!(!app.lanes[0].is_annotations());
+        assert_eq!(app.lanes[1].stream_id(), 2);
+        assert!(app.lanes[1].is_annotations());
+        assert_eq!(app.lanes[2].stream_id(), 2);
+        assert!(!app.lanes[2].is_annotations());
+    }
+
+    // ── Scroll: one lane == one row ──────────────────────────────────────────
+
+    #[test]
+    fn test_scroll_keeps_active_lane_visible() {
+        let kernels = vec![
+            make_kernel(1, 0.0, 1.0),
+            make_kernel(2, 0.0, 1.0),
+            make_kernel(3, 0.0, 1.0),
+            make_kernel(4, 0.0, 1.0),
+        ];
+        let mut app = app_from(kernels);
+        assert_eq!(app.lanes.len(), 4);
+
+        let visible_rows = 2;
+        app.ensure_active_lane_visible(visible_rows);
+        assert_eq!(app.lane_view_offset, 0);
+
+        app.next_lane();
+        app.next_lane();
+        app.ensure_active_lane_visible(visible_rows);
+        assert_eq!(app.active_lane, 2);
+        assert_eq!(app.lane_view_offset, 1);
+
+        app.next_lane();
+        app.ensure_active_lane_visible(visible_rows);
+        assert_eq!(app.lane_view_offset, 2);
+    }
+
+    // ── Search over both kinds ───────────────────────────────────────────────
+
+    #[test]
+    fn test_search_jumps_to_first_match_across_lanes() {
+        let kernels = vec![
+            named_kernel(3, 100.0, "elementwise_add"),
+            named_kernel(3, 200.0, "reduce_sum"),
+            named_kernel(7, 150.0, "volta_sgemm_128"),
+            named_kernel(7, 250.0, "ampere_gemm"),
+        ];
+        let mut app = app_from(kernels);
+
+        app.search_start();
+        assert!(app.search_active);
+        app.search_push('v');
+        app.search_push('o');
+        app.search_push('l');
+
+        assert!(!app.search_no_match);
+        assert_eq!(app.active_stream(), 7);
+        match app.selected_trace_item().unwrap() {
+            SelectedTraceItem::Kernel(k) => assert_eq!(k.name, "volta_sgemm_128"),
+            _ => panic!("expected kernel"),
+        }
+
+        app.search_commit();
+        assert!(!app.search_active);
+    }
+
+    #[test]
+    fn test_search_finds_annotation() {
+        let mut app = app_with_annotations();
+        app.search_start();
+        app.search_push('c');
+        app.search_push('t');
+        app.search_push('x');
+        app.search_push('_');
+        app.search_push('1');
+        assert!(!app.search_no_match);
+        match app.selected_trace_item().unwrap() {
+            SelectedTraceItem::Annotation(a) => assert_eq!(a.name, "ctx_1"),
+            _ => panic!("expected annotation"),
+        }
+    }
+
+    #[test]
+    fn test_search_case_insensitive_and_no_match() {
+        let kernels = vec![
+            named_kernel(3, 100.0, "Reduce_Sum"),
+            named_kernel(7, 150.0, "GEMM"),
+        ];
+        let mut app = app_from(kernels);
+
+        app.search_start();
+        app.search_push('g');
+        app.search_push('e');
+        assert!(!app.search_no_match);
+        match app.selected_trace_item().unwrap() {
+            SelectedTraceItem::Kernel(k) => assert_eq!(k.name, "GEMM"),
+            _ => panic!("expected kernel"),
+        }
+
+        app.search_push('z');
+        assert!(app.search_no_match);
+    }
+
+    #[test]
+    fn test_search_cancel_resets() {
+        let kernels = vec![named_kernel(3, 100.0, "foo"), named_kernel(7, 150.0, "bar")];
+        let mut app = app_from(kernels);
+        app.search_start();
+        app.search_push('b');
+        assert_eq!(app.active_stream(), 7);
+        app.search_cancel();
+        assert!(!app.search_active);
+        assert!(app.search_query.is_empty());
     }
 
     #[test]
@@ -559,111 +911,5 @@ mod tests {
         let (s, e) = kernel_columns(950.0, 1050.0, 1000.0, 1100.0, 100).unwrap();
         assert_eq!(s, 0);
         assert_eq!(e, 50);
-    }
-
-    fn named_kernel(stream: u64, ts: f64, name: &str) -> KernelEvent {
-        KernelEvent {
-            name: name.to_string(),
-            cat: "kernel".to_string(),
-            ts,
-            dur: 5.0,
-            device: 0,
-            stream,
-            grid: None,
-            block: None,
-            shared_memory: None,
-            registers_per_thread: None,
-            correlation: None,
-        }
-    }
-
-    #[test]
-    fn test_search_jumps_to_first_match_across_streams() {
-        let kernels = vec![
-            named_kernel(3, 100.0, "elementwise_add"),
-            named_kernel(3, 200.0, "reduce_sum"),
-            named_kernel(7, 150.0, "volta_sgemm_128"),
-            named_kernel(7, 250.0, "ampere_gemm"),
-        ];
-        let mut app = app_from(kernels);
-        assert_eq!(app.active_stream(), 3);
-
-        app.search_start();
-        assert!(app.search_active);
-
-        app.search_push('v');
-        app.search_push('o');
-        app.search_push('l');
-
-        assert!(!app.search_no_match);
-        assert_eq!(app.active_stream(), 7);
-        assert_eq!(app.selected_event().unwrap().name, "volta_sgemm_128");
-
-        app.search_commit();
-        assert!(!app.search_active);
-        assert_eq!(app.active_stream(), 7);
-    }
-
-    #[test]
-    fn test_search_case_insensitive_and_no_match() {
-        let kernels = vec![
-            named_kernel(3, 100.0, "Reduce_Sum"),
-            named_kernel(7, 150.0, "GEMM"),
-        ];
-        let mut app = app_from(kernels);
-
-        app.search_start();
-        app.search_push('g');
-        app.search_push('e');
-        assert!(!app.search_no_match);
-        assert_eq!(app.selected_event().unwrap().name, "GEMM");
-
-        app.search_push('z');
-        assert!(app.search_no_match);
-    }
-
-    #[test]
-    fn test_search_cancel_resets() {
-        let kernels = vec![named_kernel(3, 100.0, "foo"), named_kernel(7, 150.0, "bar")];
-        let mut app = app_from(kernels);
-        app.search_start();
-        app.search_push('b');
-        assert_eq!(app.active_stream(), 7);
-        app.search_cancel();
-        assert!(!app.search_active);
-        assert!(app.search_query.is_empty());
-    }
-
-    fn app_with_annotations() -> App {
-        let kernels = vec![
-            named_kernel(4, 100.0, "kernel_a"),
-            named_kernel(4, 200.0, "kernel_b"),
-        ];
-        let annotations = vec![
-            AnnotationEvent { name: "ctx_0".to_string(), ts: 90.0, dur: 60.0, stream: 4 },
-            AnnotationEvent { name: "ctx_1".to_string(), ts: 180.0, dur: 40.0, stream: 4 },
-        ];
-        App::new(Trace { kernels, annotations })
-    }
-
-    #[test]
-    fn test_annotations_available_for_rendering() {
-        let app = app_with_annotations();
-        assert_eq!(app.active_stream(), 4);
-        assert_eq!(app.annotation_indices_for_stream(4).len(), 2);
-        assert_eq!(app.annotation_indices_for_stream(999).len(), 0);
-    }
-
-    #[test]
-    fn test_navigation_ignores_annotations() {
-        let mut app = app_with_annotations();
-        assert_eq!(app.selected_kernel, 0);
-        app.next_kernel();
-        assert_eq!(app.selected_kernel, 1);
-        assert_eq!(app.selected_event().unwrap().name, "kernel_b");
-        app.next_kernel();
-        assert_eq!(app.selected_kernel, 1);
-        app.prev_kernel();
-        assert_eq!(app.selected_kernel, 0);
     }
 }
