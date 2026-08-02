@@ -63,7 +63,7 @@ fn main() -> Result<()> {
 }
 
 fn select_trace_interactively() -> Result<Option<String>> {
-    let mut traces: Vec<PathBuf> = std::fs::read_dir(".")
+    let mut traces: Vec<(PathBuf, std::time::SystemTime, u64)> = std::fs::read_dir(".")
         .context("Failed to read current directory")?
         .filter_map(|entry| entry.ok().map(|e| e.path()))
         .filter(|p| {
@@ -72,19 +72,25 @@ fn select_trace_interactively() -> Result<Option<String>> {
                 .map(|n| n.ends_with(".pt.trace.json.gz"))
                 .unwrap_or(false)
         })
+        .filter_map(|p| {
+            let meta = std::fs::metadata(&p).ok()?;
+            let mtime = meta.modified().ok()?;
+            let size = meta.len();
+            Some((p, mtime, size))
+        })
         .collect();
 
     if traces.is_empty() {
         bail!("No trace file given and no *.pt.trace.json.gz found in current directory");
     }
 
-    traces.sort();
+    traces.sort_by(|a, b| b.1.cmp(&a.1));
 
     println!("Select a trace to open:");
-    for (i, path) in traces.iter().enumerate() {
+    for (i, (path, mtime, size)) in traces.iter().enumerate() {
         let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("?");
-        let size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
-        println!("  [{}] {} ({})", i + 1, name, human_size(size));
+        let dt = format_mtime(*mtime);
+        println!("  [{}] {}  {}  {}", i + 1, dt, human_size(*size), name);
     }
     print!("Enter number (1-{}, or q to quit): ", traces.len());
     stdout().flush().ok();
@@ -106,7 +112,37 @@ fn select_trace_interactively() -> Result<Option<String>> {
         bail!("Selection out of range: {}", choice);
     }
 
-    Ok(Some(traces[choice - 1].to_string_lossy().into_owned()))
+    Ok(Some(traces[choice - 1].0.to_string_lossy().into_owned()))
+}
+
+fn format_mtime(t: std::time::SystemTime) -> String {
+    let secs = t
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let s = secs % 60;
+    let m = (secs / 60) % 60;
+    let h = (secs / 3600) % 24;
+    let days = secs / 86400;
+    let mut y = 1970u32;
+    let mut d = days;
+    loop {
+        let dy = if y % 4 == 0 && (y % 100 != 0 || y % 400 == 0) { 366 } else { 365 };
+        if d < dy { break; }
+        d -= dy;
+        y += 1;
+    }
+    let leap = y % 4 == 0 && (y % 100 != 0 || y % 400 == 0);
+    let month_days = [31u64, if leap { 29 } else { 28 }, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    let mut mo = 1u32;
+    let mut rem = d;
+    for &md in &month_days {
+        if rem < md { break; }
+        rem -= md;
+        mo += 1;
+    }
+    let day = rem + 1;
+    format!("{:04}-{:02}-{:02} {:02}:{:02}:{:02}", y, mo, day, h, m, s)
 }
 
 fn human_size(bytes: u64) -> String {
