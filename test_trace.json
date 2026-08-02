@@ -1,0 +1,17 @@
+{
+  "traceEvents": [
+    {"name": "process_name", "ph": "M", "pid": 0, "tid": 0, "args": {"name": "GPU 0"}},
+    {"name": "thread_name", "ph": "M", "pid": 0, "tid": 7, "args": {"name": "stream 7"}},
+    {"name": "some_cpu_op", "cat": "cpu_op", "ph": "X", "ts": 100.0, "dur": 500.0, "pid": 1, "tid": 1, "args": {}},
+    {"name": "python_func", "cat": "python_function", "ph": "X", "ts": 200.0, "dur": 300.0, "pid": 1, "tid": 2, "args": {}},
+    {"name": "volta_sgemm_128x64_nn", "cat": "kernel", "ph": "X", "ts": 1234567.89, "dur": 42.5, "pid": 0, "tid": 7, "args": {"device": 0, "stream": 7, "grid": "[128, 1, 1]", "block": "[256, 1, 1]", "shared memory": 0, "registers per thread": 64, "correlation": 12345}},
+    {"name": "ampere_h100_gemm_f32", "cat": "kernel", "ph": "X", "ts": 1234620.0, "dur": 88.1, "pid": 0, "tid": 7, "args": {"device": 0, "stream": 7, "grid": "[256, 2, 1]", "block": "[128, 1, 1]", "shared memory": 4096, "registers per thread": 128, "correlation": 12346}},
+    {"name": "nchwToNhwc", "cat": "kernel", "ph": "X", "ts": 1234720.0, "dur": 12.3, "pid": 0, "tid": 7, "args": {"device": 0, "stream": 7, "grid": "[64, 1, 1]", "block": "[64, 1, 1]", "shared memory": 0, "registers per thread": 32, "correlation": 12347}},
+    {"name": "cudnn_bn_fw_tr_1C11_singleread", "cat": "kernel", "ph": "X", "ts": 1234740.0, "dur": 5.7, "pid": 0, "tid": 7, "args": {"device": 0, "stream": 7, "grid": "[32, 1, 1]", "block": "[32, 1, 1]", "shared memory": 512, "registers per thread": 48, "correlation": 12348}},
+    {"name": "Memcpy HtoD", "cat": "gpu_memcpy", "ph": "X", "ts": 1234600.0, "dur": 15.2, "pid": 0, "tid": 7, "args": {"device": 0, "stream": 7, "correlation": 11111}},
+    {"name": "volta_sgemm_64x64_tn", "cat": "kernel", "ph": "X", "ts": 1235000.0, "dur": 200.0, "pid": 0, "tid": 3, "args": {"device": 0, "stream": 3, "grid": "[64, 64, 1]", "block": "[64, 1, 1]", "shared memory": 8192, "registers per thread": 96, "correlation": 22222}},
+    {"name": "elementwise_add_kernel", "cat": "kernel", "ph": "X", "ts": 1235210.0, "dur": 7.8, "pid": 0, "tid": 3, "args": {"device": 0, "stream": 3, "grid": "[512, 1, 1]", "block": "[256, 1, 1]", "shared memory": 0, "registers per thread": 16, "correlation": 22223}},
+    {"name": "Memset", "cat": "gpu_memset", "ph": "X", "ts": 1234580.0, "dur": 3.1, "pid": 0, "tid": 3, "args": {"device": 0, "stream": 3, "correlation": 33333}},
+    {"name": "reduce_kernel_256", "cat": "kernel", "ph": "X", "ts": 1235230.0, "dur": 55.0, "pid": 0, "tid": 3, "args": {"device": 0, "stream": 3, "grid": "[128, 1, 1]", "block": "[256, 1, 1]", "shared memory": 2048, "registers per thread": 64, "correlation": 22224}}
+  ]
+}
