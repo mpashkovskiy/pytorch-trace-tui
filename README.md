@@ -39,20 +39,21 @@ pytorch-trace-tui
 
 | Key             | Action                          |
 | --------------- | ------------------------------- |
-| `A` / `←`       | Move to previous item in the focused lane |
-| `D` / `→`       | Move to next item in the focused lane |
+| `A` / `←`       | Move to previous item in the current lane |
+| `D` / `→`       | Move to next item in the current lane |
 | `W` / `↑`       | Zoom in                         |
 | `S` / `↓`       | Zoom out                        |
-| `Tab`           | Next GPU stream                 |
-| `Shift+Tab`     | Previous GPU stream             |
-| `E`             | Toggle focus between the kernel lane and the annotation lane |
+| `Tab`           | Next lane (annotation lane, then kernel lane, then next stream) |
+| `Shift+Tab`     | Previous lane                   |
 | `/`             | Incremental kernel name search  |
 | `Q` / `Esc`     | Quit                            |
 
 Streams that contain `gpu_user_annotation` events get an extra annotation lane
-rendered directly above their kernel lane, sharing the same time axis. Press `E`
-to move focus onto that lane and use `A`/`D` to step through the annotations;
-the bottom panel then shows the selected annotation's details.
+rendered directly above their kernel lane, sharing the same time axis. `Tab`
+walks through every lane top to bottom: for a stream with annotations it lands
+on the annotation lane first, then the kernel lane, then moves on to the next
+stream. `A`/`D` step through whatever lane is current, and the bottom panel shows
+the selected item's details.
 
 The bottom panel shows full details for the selected kernel: name, stream,
 device, start/end/duration, grid/block dimensions, shared memory, registers per

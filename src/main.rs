@@ -235,9 +235,6 @@ fn event_loop(
                         KeyCode::Char('s') | KeyCode::Char('S') | KeyCode::Down => {
                             app.zoom_out();
                         }
-                        KeyCode::Char('e') | KeyCode::Char('E') => {
-                            app.toggle_focus();
-                        }
                         KeyCode::Tab => {
                             app.next_stream();
                         }

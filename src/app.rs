@@ -131,17 +131,6 @@ impl App {
         self.annotations.get(idx)
     }
 
-    pub fn toggle_focus(&mut self) {
-        if self.filtered_annotations.is_empty() {
-            self.focus = Lane::Kernels;
-            return;
-        }
-        self.focus = match self.focus {
-            Lane::Kernels => Lane::Annotations,
-            Lane::Annotations => Lane::Kernels,
-        };
-    }
-
     pub fn prev(&mut self) {
         match self.focus {
             Lane::Kernels => self.prev_kernel(),
@@ -203,20 +192,45 @@ impl App {
     }
 
     pub fn next_stream(&mut self) {
-        if self.streams.len() <= 1 {
-            return;
-        }
-        self.active_stream_idx = (self.active_stream_idx + 1) % self.streams.len();
-        self.rebuild_filter();
+        self.advance_lane(true);
     }
 
     pub fn prev_stream(&mut self) {
-        if self.streams.len() <= 1 {
+        self.advance_lane(false);
+    }
+
+    fn stream_has_annotations(&self, stream_id: u64) -> bool {
+        self.annotations.iter().any(|a| a.stream == stream_id)
+    }
+
+    fn advance_lane(&mut self, forward: bool) {
+        let n = self.streams.len();
+        if n == 0 {
             return;
         }
-        self.active_stream_idx =
-            (self.active_stream_idx + self.streams.len() - 1) % self.streams.len();
-        self.rebuild_filter();
+        let has_ann = self.stream_has_annotations(self.active_stream());
+
+        if forward {
+            if self.focus == Lane::Annotations {
+                self.focus = Lane::Kernels;
+                return;
+            }
+            self.active_stream_idx = (self.active_stream_idx + 1) % n;
+            self.rebuild_filter();
+            if self.stream_has_annotations(self.active_stream()) {
+                self.focus = Lane::Annotations;
+            } else {
+                self.focus = Lane::Kernels;
+            }
+        } else {
+            if self.focus == Lane::Kernels && has_ann {
+                self.focus = Lane::Annotations;
+                return;
+            }
+            self.active_stream_idx = (self.active_stream_idx + n - 1) % n;
+            self.rebuild_filter();
+            self.focus = Lane::Kernels;
+        }
     }
 
     pub fn search_start(&mut self) {
@@ -689,11 +703,12 @@ mod tests {
     }
 
     #[test]
-    fn test_toggle_focus_and_annotation_nav() {
+    fn test_tab_cycles_annotation_then_kernel_lane() {
         let mut app = app_with_annotations();
+        assert_eq!(app.streams.len(), 1);
         assert_eq!(app.focus, Lane::Kernels);
 
-        app.toggle_focus();
+        app.next_stream();
         assert_eq!(app.focus, Lane::Annotations);
 
         assert_eq!(app.selected_annotation, 0);
@@ -705,17 +720,23 @@ mod tests {
         app.prev();
         assert_eq!(app.selected_annotation, 0);
 
-        app.toggle_focus();
+        app.next_stream();
         assert_eq!(app.focus, Lane::Kernels);
         app.next();
         assert_eq!(app.selected_kernel, 1);
     }
 
     #[test]
-    fn test_toggle_focus_noop_without_annotations() {
-        let mut app = app_from(vec![named_kernel(3, 100.0, "k")]);
+    fn test_tab_stays_on_kernels_without_annotations() {
+        let mut app = app_from(vec![
+            named_kernel(3, 100.0, "a"),
+            named_kernel(7, 150.0, "b"),
+        ]);
         assert!(app.filtered_annotations.is_empty());
-        app.toggle_focus();
+        assert_eq!(app.focus, Lane::Kernels);
+        app.next_stream();
+        assert_eq!(app.focus, Lane::Kernels);
+        app.next_stream();
         assert_eq!(app.focus, Lane::Kernels);
     }
 }

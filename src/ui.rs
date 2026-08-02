@@ -80,7 +80,7 @@ fn render_header(frame: &mut Frame, area: Rect, app: &App) {
         Span::styled("Zoom: ", Style::new().fg(Color::DarkGray)),
         Span::styled(app.zoom_label(), Style::new().fg(Color::Magenta).bold()),
         Span::styled(
-            "  [/] search  [Tab] stream  [E] lane  [A/D] move  [W/S] zoom  [Q] quit",
+            "  [/] search  [Tab/S-Tab] lane  [A/D] move  [W/S] zoom  [Q] quit",
             Style::new().fg(Color::DarkGray),
         ),
     ]);
@@ -267,6 +267,13 @@ fn build_annotation_lane(
         else {
             continue;
         };
+
+        // Clamp to cursor: sub-column annotations must not each steal a full
+        // column, or cumulative drift pushes later annotations off the lane.
+        let a_start_col = a_start_col.max(cursor);
+        if a_start_col >= a_end_col || a_start_col >= width {
+            continue;
+        }
 
         if a_start_col > cursor {
             spans.push(Span::styled(
