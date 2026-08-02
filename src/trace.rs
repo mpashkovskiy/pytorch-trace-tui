@@ -6,7 +6,13 @@ use std::fs::File;
 use std::io::{BufRead, BufReader};
 
 const GPU_CATS: &[&str] = &["kernel", "gpu_memcpy", "gpu_memset"];
-const GPU_CATS_BYTES: &[&[u8]] = &[b"kernel", b"gpu_memcpy", b"gpu_memset"];
+const ANNOTATION_CAT: &str = "gpu_user_annotation";
+const KEEP_CATS_BYTES: &[&[u8]] = &[
+    b"kernel",
+    b"gpu_memcpy",
+    b"gpu_memset",
+    b"gpu_user_annotation",
+];
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct RawEvent {
@@ -41,10 +47,30 @@ impl KernelEvent {
     }
 }
 
-pub fn parse_trace(path: &str) -> Result<Vec<KernelEvent>> {
+#[derive(Debug, Clone, Serialize)]
+pub struct AnnotationEvent {
+    pub name: String,
+    pub ts: f64,
+    pub dur: f64,
+    pub stream: u64,
+}
+
+impl AnnotationEvent {
+    pub fn end_ts(&self) -> f64 {
+        self.ts + self.dur
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct Trace {
+    pub kernels: Vec<KernelEvent>,
+    pub annotations: Vec<AnnotationEvent>,
+}
+
+pub fn parse_trace(path: &str) -> Result<Trace> {
     let file = File::open(path).with_context(|| format!("Cannot open trace file: {}", path))?;
 
-    let mut kernels = if path.ends_with(".gz") {
+    let mut trace = if path.ends_with(".gz") {
         let gz = GzDecoder::new(file);
         let reader = BufReader::with_capacity(1 << 16, gz);
         parse_lexer(reader)
@@ -54,11 +80,16 @@ pub fn parse_trace(path: &str) -> Result<Vec<KernelEvent>> {
     }
     .context("Failed to parse trace")?;
 
-    kernels.sort_by(|a, b| a.ts.partial_cmp(&b.ts).unwrap_or(std::cmp::Ordering::Equal));
-    Ok(kernels)
+    trace
+        .kernels
+        .sort_by(|a, b| a.ts.partial_cmp(&b.ts).unwrap_or(std::cmp::Ordering::Equal));
+    trace
+        .annotations
+        .sort_by(|a, b| a.ts.partial_cmp(&b.ts).unwrap_or(std::cmp::Ordering::Equal));
+    Ok(trace)
 }
 
-fn parse_lexer<R: BufRead>(mut reader: R) -> Result<Vec<KernelEvent>> {
+fn parse_lexer<R: BufRead>(mut reader: R) -> Result<Trace> {
     const CHUNK: usize = 1 << 16;
 
     let first = peek_first_nonws(&mut reader)?;
@@ -74,7 +105,7 @@ fn parse_lexer<R: BufRead>(mut reader: R) -> Result<Vec<KernelEvent>> {
     }
 }
 
-fn lex_object<R: BufRead>(reader: R, chunk: usize) -> Result<Vec<KernelEvent>> {
+fn lex_object<R: BufRead>(reader: R, chunk: usize) -> Result<Trace> {
     let te_marker = b"traceEvents";
     let mut window: Vec<u8> = Vec::with_capacity(chunk * 2);
     let mut rdr = reader;
@@ -105,13 +136,13 @@ fn lex_object<R: BufRead>(reader: R, chunk: usize) -> Result<Vec<KernelEvent>> {
     }
 
     if !found {
-        return Ok(vec![]);
+        return Ok(Trace::default());
     }
 
     lex_events_array(rdr, window, chunk)
 }
 
-fn lex_array<R: BufRead>(reader: R, chunk: usize) -> Result<Vec<KernelEvent>> {
+fn lex_array<R: BufRead>(reader: R, chunk: usize) -> Result<Trace> {
     let window = Vec::new();
     lex_events_array(reader, window, chunk)
 }
@@ -120,8 +151,9 @@ fn lex_events_array<R: BufRead>(
     mut rdr: R,
     window: Vec<u8>,
     _chunk: usize,
-) -> Result<Vec<KernelEvent>> {
+) -> Result<Trace> {
     let mut kernels: Vec<KernelEvent> = Vec::with_capacity(65536);
+    let mut annotations: Vec<AnnotationEvent> = Vec::new();
 
     let mut depth: u32 = 0;
     let mut in_string = false;
@@ -200,8 +232,10 @@ fn lex_events_array<R: BufRead>(
                     if depth == 1 {
                         if state == State::Keep && !event_buf.is_empty() {
                             if let Ok(raw) = serde_json::from_slice::<RawEvent>(&event_buf) {
-                                if let Some(k) = try_into_kernel(raw) {
-                                    kernels.push(k);
+                                match classify(raw) {
+                                    Some(Parsed::Kernel(k)) => kernels.push(k),
+                                    Some(Parsed::Annotation(a)) => annotations.push(a),
+                                    None => {}
                                 }
                             }
                         }
@@ -254,7 +288,10 @@ fn lex_events_array<R: BufRead>(
         }
     }
 
-    Ok(kernels)
+    Ok(Trace {
+        kernels,
+        annotations,
+    })
 }
 
 fn cat_in_header(buf: &[u8]) -> Option<bool> {
@@ -284,7 +321,7 @@ fn cat_in_header(buf: &[u8]) -> Option<bool> {
         return None;
     }
     let val = &after[val_start..i];
-    Some(GPU_CATS_BYTES.contains(&val))
+    Some(KEEP_CATS_BYTES.contains(&val))
 }
 
 fn peek_first_nonws<R: BufRead>(reader: &mut R) -> Result<u8> {
@@ -304,19 +341,35 @@ fn peek_first_nonws<R: BufRead>(reader: &mut R) -> Result<u8> {
     }
 }
 
-fn try_into_kernel(e: RawEvent) -> Option<KernelEvent> {
+enum Parsed {
+    Kernel(KernelEvent),
+    Annotation(AnnotationEvent),
+}
+
+fn classify(e: RawEvent) -> Option<Parsed> {
     let ph = e.ph.as_deref().unwrap_or("");
     if ph == "M" || ph == "i" || ph == "I" {
         return None;
     }
     let cat = e.cat.as_deref().unwrap_or("");
+    let ts = e.ts?;
+    let dur = e.dur.unwrap_or(0.0);
+    let stream = tid_to_u64(&e.tid).unwrap_or(0);
+
+    if cat == ANNOTATION_CAT {
+        let name = e.name.unwrap_or_else(|| "(unnamed)".to_string());
+        return Some(Parsed::Annotation(AnnotationEvent {
+            name,
+            ts,
+            dur,
+            stream,
+        }));
+    }
+
     if !GPU_CATS.contains(&cat) {
         return None;
     }
-    let ts = e.ts?;
-    let dur = e.dur.unwrap_or(0.0);
     let name = e.name.unwrap_or_else(|| "(unnamed)".to_string());
-    let stream = tid_to_u64(&e.tid).unwrap_or(0);
     let device = args_u64(&e.args, "device")
         .or_else(|| tid_to_u64(&e.pid))
         .unwrap_or(0);
@@ -326,7 +379,7 @@ fn try_into_kernel(e: RawEvent) -> Option<KernelEvent> {
     let registers_per_thread = args_u64(&e.args, "registers per thread");
     let correlation = args_u64(&e.args, "correlation");
 
-    Some(KernelEvent {
+    Some(Parsed::Kernel(KernelEvent {
         name,
         cat: cat.to_string(),
         ts,
@@ -338,7 +391,7 @@ fn try_into_kernel(e: RawEvent) -> Option<KernelEvent> {
         shared_memory,
         registers_per_thread,
         correlation,
-    })
+    }))
 }
 
 fn tid_to_u64(v: &Option<serde_json::Value>) -> Option<u64> {
@@ -383,10 +436,17 @@ mod tests {
         }
     }
 
+    fn classify_kernel(e: RawEvent) -> Option<KernelEvent> {
+        match classify(e) {
+            Some(Parsed::Kernel(k)) => Some(k),
+            _ => None,
+        }
+    }
+
     #[test]
     fn test_gpu_kernel_accepted() {
         let e = make_raw("kernel", "X", 1000.0, 50.0, 7);
-        let k = try_into_kernel(e).expect("Should parse GPU kernel");
+        let k = classify_kernel(e).expect("Should parse GPU kernel");
         assert_eq!(k.name, "test_kernel");
         assert_eq!(k.stream, 7);
         assert!((k.ts - 1000.0).abs() < f64::EPSILON);
@@ -396,21 +456,33 @@ mod tests {
     #[test]
     fn test_cpu_op_rejected() {
         let e = make_raw("cpu_op", "X", 1000.0, 50.0, 0);
-        assert!(try_into_kernel(e).is_none());
+        assert!(classify_kernel(e).is_none());
     }
 
     #[test]
     fn test_metadata_rejected() {
         let e = make_raw("kernel", "M", 0.0, 0.0, 0);
-        assert!(try_into_kernel(e).is_none());
+        assert!(classify(e).is_none());
     }
 
     #[test]
     fn test_gpu_memcpy_accepted() {
         let e = make_raw("gpu_memcpy", "X", 2000.0, 10.0, 3);
-        let k = try_into_kernel(e).expect("Should parse gpu_memcpy");
+        let k = classify_kernel(e).expect("Should parse gpu_memcpy");
         assert_eq!(k.cat, "gpu_memcpy");
         assert_eq!(k.stream, 3);
+    }
+
+    #[test]
+    fn test_annotation_accepted() {
+        let e = make_raw("gpu_user_annotation", "X", 500.0, 1000.0, 4);
+        let a = match classify(e) {
+            Some(Parsed::Annotation(a)) => a,
+            _ => panic!("Should parse annotation"),
+        };
+        assert_eq!(a.stream, 4);
+        assert!((a.ts - 500.0).abs() < f64::EPSILON);
+        assert!((a.dur - 1000.0).abs() < f64::EPSILON);
     }
 
     #[test]
@@ -421,16 +493,20 @@ mod tests {
                 {"name":"my_kernel","cat":"kernel","ph":"X","ts":10.0,"dur":3.0,"pid":0,"tid":7,
                  "args":{"device":0,"stream":7,"grid":"[32,1,1]","block":"[128,1,1]",
                          "shared memory":0,"registers per thread":32,"correlation":99}},
+                {"name":"my_ctx","cat":"gpu_user_annotation","ph":"X","ts":8.0,"dur":20.0,"pid":0,"tid":7},
                 {"name":"process_name","ph":"M","pid":0,"tid":0,"args":{"name":"GPU 0"}}
             ],
             "displayTimeUnit": "ms"
         }"#;
         let reader = BufReader::new(json.as_bytes());
-        let kernels = parse_lexer(reader).expect("Should parse object wrapper");
-        assert_eq!(kernels.len(), 1);
-        assert_eq!(kernels[0].name, "my_kernel");
-        assert_eq!(kernels[0].stream, 7);
-        assert_eq!(kernels[0].grid.as_deref(), Some("[32,1,1]"));
+        let trace = parse_lexer(reader).expect("Should parse object wrapper");
+        assert_eq!(trace.kernels.len(), 1);
+        assert_eq!(trace.kernels[0].name, "my_kernel");
+        assert_eq!(trace.kernels[0].stream, 7);
+        assert_eq!(trace.kernels[0].grid.as_deref(), Some("[32,1,1]"));
+        assert_eq!(trace.annotations.len(), 1);
+        assert_eq!(trace.annotations[0].name, "my_ctx");
+        assert_eq!(trace.annotations[0].stream, 7);
     }
 
     #[test]
@@ -441,10 +517,10 @@ mod tests {
             {"name":"kern_b","cat":"gpu_memcpy","ph":"X","ts":8.0,"dur":1.0,"pid":0,"tid":3}
         ]"#;
         let reader = BufReader::new(json.as_bytes());
-        let kernels = parse_lexer(reader).expect("Should parse bare array");
-        assert_eq!(kernels.len(), 2);
-        assert_eq!(kernels[0].name, "kern_a");
-        assert_eq!(kernels[1].name, "kern_b");
+        let trace = parse_lexer(reader).expect("Should parse bare array");
+        assert_eq!(trace.kernels.len(), 2);
+        assert_eq!(trace.kernels[0].name, "kern_a");
+        assert_eq!(trace.kernels[1].name, "kern_b");
     }
 
     #[test]
@@ -466,8 +542,8 @@ mod tests {
             gz.finish().unwrap();
         }
 
-        let kernels = parse_trace(path).expect("Should parse .json.gz");
-        assert_eq!(kernels.len(), 1);
-        assert_eq!(kernels[0].name, "gz_kernel");
+        let trace = parse_trace(path).expect("Should parse .json.gz");
+        assert_eq!(trace.kernels.len(), 1);
+        assert_eq!(trace.kernels[0].name, "gz_kernel");
     }
 }

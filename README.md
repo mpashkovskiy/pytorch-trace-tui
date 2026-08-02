@@ -1,5 +1,7 @@
 # pytorch-trace-tui
 
+![](demo.gif)
+
 A terminal UI for exploring **GPU kernels** in PyTorch profiler traces, rendered
 Perfetto-style as horizontal timeline lanes — one lane per CUDA stream, all
 sharing a single time axis.
@@ -37,13 +39,20 @@ pytorch-trace-tui
 
 | Key             | Action                          |
 | --------------- | ------------------------------- |
-| `A` / `←`       | Select previous kernel          |
-| `D` / `→`       | Select next kernel              |
+| `A` / `←`       | Move to previous item in the focused lane |
+| `D` / `→`       | Move to next item in the focused lane |
 | `W` / `↑`       | Zoom in                         |
 | `S` / `↓`       | Zoom out                        |
 | `Tab`           | Next GPU stream                 |
 | `Shift+Tab`     | Previous GPU stream             |
+| `E`             | Toggle focus between the kernel lane and the annotation lane |
+| `/`             | Incremental kernel name search  |
 | `Q` / `Esc`     | Quit                            |
+
+Streams that contain `gpu_user_annotation` events get an extra annotation lane
+rendered directly above their kernel lane, sharing the same time axis. Press `E`
+to move focus onto that lane and use `A`/`D` to step through the annotations;
+the bottom panel then shows the selected annotation's details.
 
 The bottom panel shows full details for the selected kernel: name, stream,
 device, start/end/duration, grid/block dimensions, shared memory, registers per

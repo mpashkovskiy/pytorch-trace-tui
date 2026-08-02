@@ -1,15 +1,25 @@
-use crate::trace::KernelEvent;
+use crate::trace::{AnnotationEvent, KernelEvent, Trace};
 
 const ZOOM_MIN: f64 = 0.1;
 const ZOOM_FACTOR: f64 = 1.5;
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Lane {
+    Kernels,
+    Annotations,
+}
+
 #[derive(Debug, Clone)]
 pub struct App {
     pub kernels: Vec<KernelEvent>,
+    pub annotations: Vec<AnnotationEvent>,
     pub streams: Vec<u64>,
     pub active_stream_idx: usize,
     pub filtered_indices: Vec<usize>,
     pub selected_kernel: usize,
+    pub filtered_annotations: Vec<usize>,
+    pub selected_annotation: usize,
+    pub focus: Lane,
     pub zoom_level: f64,
     pub view_offset: usize,
     pub stream_view_offset: usize,
@@ -19,7 +29,9 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(kernels: Vec<KernelEvent>) -> Self {
+    pub fn new(trace: Trace) -> Self {
+        let kernels = trace.kernels;
+        let annotations = trace.annotations;
         // Collect unique streams
         let mut streams: Vec<u64> = {
             let mut s: Vec<u64> = kernels.iter().map(|k| k.stream).collect();
@@ -33,10 +45,14 @@ impl App {
 
         let mut app = App {
             kernels,
+            annotations,
             streams,
             active_stream_idx: 0,
             filtered_indices: vec![],
             selected_kernel: 0,
+            filtered_annotations: vec![],
+            selected_annotation: 0,
+            focus: Lane::Kernels,
             zoom_level: 1.0,
             view_offset: 0,
             stream_view_offset: 0,
@@ -62,6 +78,24 @@ impl App {
         } else {
             self.selected_kernel = self.selected_kernel.min(self.filtered_indices.len() - 1);
         }
+
+        self.filtered_annotations = self
+            .annotations
+            .iter()
+            .enumerate()
+            .filter(|(_, a)| a.stream == stream_id)
+            .map(|(i, _)| i)
+            .collect();
+        if self.filtered_annotations.is_empty() {
+            self.selected_annotation = 0;
+            if self.focus == Lane::Annotations {
+                self.focus = Lane::Kernels;
+            }
+        } else {
+            self.selected_annotation =
+                self.selected_annotation.min(self.filtered_annotations.len() - 1);
+        }
+
         self.view_offset = 0;
     }
 
@@ -83,7 +117,46 @@ impl App {
         self.kernels.get(idx)
     }
 
-    pub fn prev_kernel(&mut self) {
+    pub fn annotation_indices_for_stream(&self, stream_id: u64) -> Vec<usize> {
+        self.annotations
+            .iter()
+            .enumerate()
+            .filter(|(_, a)| a.stream == stream_id)
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    pub fn selected_annotation_event(&self) -> Option<&AnnotationEvent> {
+        let idx = *self.filtered_annotations.get(self.selected_annotation)?;
+        self.annotations.get(idx)
+    }
+
+    pub fn toggle_focus(&mut self) {
+        if self.filtered_annotations.is_empty() {
+            self.focus = Lane::Kernels;
+            return;
+        }
+        self.focus = match self.focus {
+            Lane::Kernels => Lane::Annotations,
+            Lane::Annotations => Lane::Kernels,
+        };
+    }
+
+    pub fn prev(&mut self) {
+        match self.focus {
+            Lane::Kernels => self.prev_kernel(),
+            Lane::Annotations => self.prev_annotation(),
+        }
+    }
+
+    pub fn next(&mut self) {
+        match self.focus {
+            Lane::Kernels => self.next_kernel(),
+            Lane::Annotations => self.next_annotation(),
+        }
+    }
+
+    fn prev_kernel(&mut self) {
         if self.filtered_indices.is_empty() {
             return;
         }
@@ -93,7 +166,7 @@ impl App {
         self.clamp_view_offset();
     }
 
-    pub fn next_kernel(&mut self) {
+    fn next_kernel(&mut self) {
         if self.filtered_indices.is_empty() {
             return;
         }
@@ -101,6 +174,24 @@ impl App {
             self.selected_kernel += 1;
         }
         self.clamp_view_offset();
+    }
+
+    fn prev_annotation(&mut self) {
+        if self.filtered_annotations.is_empty() {
+            return;
+        }
+        if self.selected_annotation > 0 {
+            self.selected_annotation -= 1;
+        }
+    }
+
+    fn next_annotation(&mut self) {
+        if self.filtered_annotations.is_empty() {
+            return;
+        }
+        if self.selected_annotation + 1 < self.filtered_annotations.len() {
+            self.selected_annotation += 1;
+        }
     }
 
     pub fn zoom_in(&mut self) {
@@ -216,10 +307,17 @@ impl App {
         let total_span = (g_end - g_start).max(1.0);
         let visible_span = (total_span / self.zoom_level).max(1e-3);
 
-        let center = self
-            .selected_event()
-            .map(|k| k.ts + k.dur / 2.0)
-            .unwrap_or(g_start + total_span / 2.0);
+        let center = match self.focus {
+            Lane::Annotations => self
+                .selected_annotation_event()
+                .map(|a| a.ts + a.dur / 2.0)
+                .or_else(|| self.selected_event().map(|k| k.ts + k.dur / 2.0))
+                .unwrap_or(g_start + total_span / 2.0),
+            Lane::Kernels => self
+                .selected_event()
+                .map(|k| k.ts + k.dur / 2.0)
+                .unwrap_or(g_start + total_span / 2.0),
+        };
 
         let ts_start = (center - visible_span / 2.0).max(g_start);
         let ts_end = (center + visible_span / 2.0).min(g_end);
@@ -261,7 +359,14 @@ pub fn kernel_columns(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::trace::KernelEvent;
+    use crate::trace::{AnnotationEvent, KernelEvent, Trace};
+
+    fn app_from(kernels: Vec<KernelEvent>) -> App {
+        App::new(Trace {
+            kernels,
+            annotations: vec![],
+        })
+    }
 
     fn make_kernel(stream: u64, ts: f64, dur: f64) -> KernelEvent {
         KernelEvent {
@@ -287,7 +392,7 @@ mod tests {
             make_kernel(3, 150.0, 8.0),
             make_kernel(3, 250.0, 12.0),
         ];
-        App::new(kernels)
+        app_from(kernels)
     }
 
     #[test]
@@ -384,7 +489,7 @@ mod tests {
             make_kernel(3, 0.0, 1.0),
             make_kernel(4, 0.0, 1.0),
         ];
-        let mut app = App::new(kernels);
+        let mut app = app_from(kernels);
         assert_eq!(app.streams, vec![1, 2, 3, 4]);
 
         let visible_rows = 2;
@@ -418,7 +523,7 @@ mod tests {
             make_kernel(4, base + 100_000_000.0, 4.0),
             make_kernel(4, base + 200_000_000.0, 4.0),
         ];
-        let mut app = App::new(kernels);
+        let mut app = app_from(kernels);
 
         let (s0, e0) = app.global_visible_window();
         let full_span = e0 - s0;
@@ -514,7 +619,7 @@ mod tests {
             named_kernel(7, 150.0, "volta_sgemm_128"),
             named_kernel(7, 250.0, "ampere_gemm"),
         ];
-        let mut app = App::new(kernels);
+        let mut app = app_from(kernels);
         assert_eq!(app.active_stream(), 3);
 
         app.search_start();
@@ -539,7 +644,7 @@ mod tests {
             named_kernel(3, 100.0, "Reduce_Sum"),
             named_kernel(7, 150.0, "GEMM"),
         ];
-        let mut app = App::new(kernels);
+        let mut app = app_from(kernels);
 
         app.search_start();
         app.search_push('g');
@@ -554,12 +659,63 @@ mod tests {
     #[test]
     fn test_search_cancel_resets() {
         let kernels = vec![named_kernel(3, 100.0, "foo"), named_kernel(7, 150.0, "bar")];
-        let mut app = App::new(kernels);
+        let mut app = app_from(kernels);
         app.search_start();
         app.search_push('b');
         assert_eq!(app.active_stream(), 7);
         app.search_cancel();
         assert!(!app.search_active);
         assert!(app.search_query.is_empty());
+    }
+
+    fn app_with_annotations() -> App {
+        let kernels = vec![
+            named_kernel(4, 100.0, "kernel_a"),
+            named_kernel(4, 200.0, "kernel_b"),
+        ];
+        let annotations = vec![
+            AnnotationEvent { name: "ctx_0".to_string(), ts: 90.0, dur: 60.0, stream: 4 },
+            AnnotationEvent { name: "ctx_1".to_string(), ts: 180.0, dur: 40.0, stream: 4 },
+        ];
+        App::new(Trace { kernels, annotations })
+    }
+
+    #[test]
+    fn test_annotations_filtered_per_stream() {
+        let app = app_with_annotations();
+        assert_eq!(app.active_stream(), 4);
+        assert_eq!(app.filtered_annotations.len(), 2);
+        assert_eq!(app.selected_annotation_event().unwrap().name, "ctx_0");
+    }
+
+    #[test]
+    fn test_toggle_focus_and_annotation_nav() {
+        let mut app = app_with_annotations();
+        assert_eq!(app.focus, Lane::Kernels);
+
+        app.toggle_focus();
+        assert_eq!(app.focus, Lane::Annotations);
+
+        assert_eq!(app.selected_annotation, 0);
+        app.next();
+        assert_eq!(app.selected_annotation, 1);
+        assert_eq!(app.selected_annotation_event().unwrap().name, "ctx_1");
+        app.next();
+        assert_eq!(app.selected_annotation, 1);
+        app.prev();
+        assert_eq!(app.selected_annotation, 0);
+
+        app.toggle_focus();
+        assert_eq!(app.focus, Lane::Kernels);
+        app.next();
+        assert_eq!(app.selected_kernel, 1);
+    }
+
+    #[test]
+    fn test_toggle_focus_noop_without_annotations() {
+        let mut app = app_from(vec![named_kernel(3, 100.0, "k")]);
+        assert!(app.filtered_annotations.is_empty());
+        app.toggle_focus();
+        assert_eq!(app.focus, Lane::Kernels);
     }
 }

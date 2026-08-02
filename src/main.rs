@@ -38,27 +38,28 @@ fn main() -> Result<()> {
         },
     };
 
-    let kernels = trace::parse_trace(&trace_path)
+    let trace = trace::parse_trace(&trace_path)
         .with_context(|| format!("Failed to load trace: {}", trace_path))?;
 
-    if kernels.is_empty() {
+    if trace.kernels.is_empty() {
         println!("No GPU kernels found in trace file: {}", trace_path);
         return Ok(());
     }
 
     let stream_count = {
-        let mut s: Vec<u64> = kernels.iter().map(|k| k.stream).collect();
+        let mut s: Vec<u64> = trace.kernels.iter().map(|k| k.stream).collect();
         s.sort_unstable();
         s.dedup();
         s.len()
     };
     eprintln!(
-        "Loaded {} GPU kernels across {} stream(s). Starting TUI...",
-        kernels.len(),
+        "Loaded {} GPU kernels ({} annotations) across {} stream(s). Starting TUI...",
+        trace.kernels.len(),
+        trace.annotations.len(),
         stream_count
     );
 
-    let app = App::new(kernels);
+    let app = App::new(trace);
     run_tui(app)
 }
 
@@ -223,16 +224,19 @@ fn event_loop(
                             app.search_start();
                         }
                         KeyCode::Char('a') | KeyCode::Char('A') | KeyCode::Left => {
-                            app.prev_kernel();
+                            app.prev();
                         }
                         KeyCode::Char('d') | KeyCode::Char('D') | KeyCode::Right => {
-                            app.next_kernel();
+                            app.next();
                         }
                         KeyCode::Char('w') | KeyCode::Char('W') | KeyCode::Up => {
                             app.zoom_in();
                         }
                         KeyCode::Char('s') | KeyCode::Char('S') | KeyCode::Down => {
                             app.zoom_out();
+                        }
+                        KeyCode::Char('e') | KeyCode::Char('E') => {
+                            app.toggle_focus();
                         }
                         KeyCode::Tab => {
                             app.next_stream();
