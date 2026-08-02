@@ -68,19 +68,10 @@ fn render_header(frame: &mut Frame, area: Rect, app: &App) {
             Style::new().fg(Color::Yellow),
         ),
         Span::raw("  "),
-        Span::styled("Lane: ", Style::new().fg(Color::DarkGray)),
-        Span::styled(
-            match app.focus {
-                crate::app::Lane::Kernels => "kernels",
-                crate::app::Lane::Annotations => "annotations",
-            },
-            Style::new().fg(Color::Cyan).bold(),
-        ),
-        Span::raw("  "),
         Span::styled("Zoom: ", Style::new().fg(Color::DarkGray)),
         Span::styled(app.zoom_label(), Style::new().fg(Color::Magenta).bold()),
         Span::styled(
-            "  [/] search  [Tab/S-Tab] lane  [A/D] move  [W/S] zoom  [Q] quit",
+            "  [/] search  [Tab/S-Tab] stream  [A/D] kernel  [W/S] zoom  [Q] quit",
             Style::new().fg(Color::DarkGray),
         ),
     ]);
@@ -135,13 +126,18 @@ fn render_lane(frame: &mut Frame, area: Rect, app: &App) {
 
     let visible_rows = inner.height as usize;
     let start = app.stream_view_offset.min(app.streams.len().saturating_sub(1));
-    let end = (start + visible_rows).min(app.streams.len());
 
-    for stream_idx in start..end {
+    let mut rows_used = 0usize;
+    for stream_idx in start..app.streams.len() {
         let stream_id = app.streams[stream_idx];
         let is_active = stream_idx == app.active_stream_idx;
 
         let ann_indices = app.annotation_indices_for_stream(stream_id);
+        let rows_needed = if ann_indices.is_empty() { 1 } else { 2 };
+        if rows_used + rows_needed > visible_rows {
+            break;
+        }
+
         if !ann_indices.is_empty() {
             let ann_label = pad_to(String::new(), label_width - 1);
             let mut ann_spans: Vec<Span<'static>> = vec![
@@ -152,6 +148,7 @@ fn render_lane(frame: &mut Frame, area: Rect, app: &App) {
                 app, stream_idx, ts_start, time_span, lane_width,
             ));
             lines.push(Line::from(ann_spans));
+            rows_used += 1;
         }
 
         let label = format!("cuda:{}", stream_id);
@@ -168,6 +165,7 @@ fn render_lane(frame: &mut Frame, area: Rect, app: &App) {
         ];
         spans.extend(build_stream_lane(app, stream_idx, ts_start, time_span, lane_width));
         lines.push(Line::from(spans));
+        rows_used += 1;
     }
 
     frame.render_widget(Paragraph::new(lines), inner);
@@ -251,16 +249,13 @@ fn build_annotation_lane(
     let mut cursor: usize = 0;
 
     let stream_id = app.streams[stream_idx];
-    let is_active_stream = stream_idx == app.active_stream_idx;
-    let ann_focused = is_active_stream && app.focus == crate::app::Lane::Annotations;
     let indices = app.annotation_indices_for_stream(stream_id);
 
     let ts_end = ts_start + time_span;
     let ann_bg = Color::Rgb(90, 90, 110);
 
-    for (list_idx, &ann_idx) in indices.iter().enumerate() {
+    for &ann_idx in indices.iter() {
         let a = &app.annotations[ann_idx];
-        let is_selected = ann_focused && list_idx == app.selected_annotation;
 
         let Some((a_start_col, a_end_col)) =
             crate::app::kernel_columns(a.ts, a.end_ts(), ts_start, ts_end, width)
@@ -285,11 +280,7 @@ fn build_annotation_lane(
         let block_width = a_end_col.saturating_sub(a_start_col).max(1);
         let label = pad_to(ellipsize(&a.name, block_width), block_width);
 
-        let style = if is_selected {
-            Style::new().fg(Color::Black).bg(Color::White)
-        } else {
-            Style::new().fg(Color::White).bg(ann_bg)
-        };
+        let style = Style::new().fg(Color::White).bg(ann_bg);
 
         spans.push(Span::styled(label, style));
         cursor = a_end_col;
@@ -306,50 +297,15 @@ fn build_annotation_lane(
 }
 
 fn render_info_panel(frame: &mut Frame, area: Rect, app: &App) {
-    let annotation_focus = app.focus == crate::app::Lane::Annotations;
-    let title = if annotation_focus {
-        " Annotation Info "
-    } else {
-        " Kernel Info "
-    };
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(Style::new().fg(Color::Yellow))
-        .title(title)
+        .title(" Kernel Info ")
         .title_style(Style::new().fg(Color::Yellow).bold());
 
     let inner = block.inner(area);
     frame.render_widget(block, area);
-
-    if annotation_focus {
-        let Some(a) = app.selected_annotation_event() else {
-            frame.render_widget(
-                Paragraph::new("No annotation selected").style(Style::new().fg(Color::DarkGray)),
-                inner,
-            );
-            return;
-        };
-        let lines: Vec<Line> = vec![
-            Line::from(vec![kv_label("Name: "), kv_value(&a.name)]),
-            Line::from(vec![
-                kv_label("Stream: "),
-                kv_value(&format!("cuda:{}", a.stream)),
-            ]),
-            Line::from(vec![
-                kv_label("Start: "),
-                kv_value(&format!("{:.3} μs", a.ts)),
-                Span::raw("  "),
-                kv_label("End: "),
-                kv_value(&format!("{:.3} μs", a.end_ts())),
-                Span::raw("  "),
-                kv_label("Dur: "),
-                kv_value(&format!("{:.3} μs", a.dur)),
-            ]),
-        ];
-        frame.render_widget(Paragraph::new(lines), inner);
-        return;
-    }
 
     let Some(k) = app.selected_event() else {
         frame.render_widget(

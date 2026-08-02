@@ -224,10 +224,10 @@ fn event_loop(
                             app.search_start();
                         }
                         KeyCode::Char('a') | KeyCode::Char('A') | KeyCode::Left => {
-                            app.prev();
+                            app.prev_kernel();
                         }
                         KeyCode::Char('d') | KeyCode::Char('D') | KeyCode::Right => {
-                            app.next();
+                            app.next_kernel();
                         }
                         KeyCode::Char('w') | KeyCode::Char('W') | KeyCode::Up => {
                             app.zoom_in();
