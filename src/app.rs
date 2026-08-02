@@ -13,6 +13,9 @@ pub struct App {
     pub zoom_level: f64,
     pub view_offset: usize,
     pub stream_view_offset: usize,
+    pub search_active: bool,
+    pub search_query: String,
+    pub search_no_match: bool,
 }
 
 impl App {
@@ -37,6 +40,9 @@ impl App {
             zoom_level: 1.0,
             view_offset: 0,
             stream_view_offset: 0,
+            search_active: false,
+            search_query: String::new(),
+            search_no_match: false,
         };
         app.rebuild_filter();
         app
@@ -120,6 +126,58 @@ impl App {
         self.active_stream_idx =
             (self.active_stream_idx + self.streams.len() - 1) % self.streams.len();
         self.rebuild_filter();
+    }
+
+    pub fn search_start(&mut self) {
+        self.search_active = true;
+        self.search_query.clear();
+        self.search_no_match = false;
+    }
+
+    pub fn search_cancel(&mut self) {
+        self.search_active = false;
+        self.search_query.clear();
+        self.search_no_match = false;
+    }
+
+    pub fn search_commit(&mut self) {
+        self.search_active = false;
+    }
+
+    pub fn search_push(&mut self, c: char) {
+        self.search_query.push(c);
+        self.search_apply();
+    }
+
+    pub fn search_backspace(&mut self) {
+        self.search_query.pop();
+        self.search_apply();
+    }
+
+    fn search_apply(&mut self) {
+        if self.search_query.is_empty() {
+            self.search_no_match = false;
+            return;
+        }
+        let needle = self.search_query.to_lowercase();
+
+        for (s_idx, &stream_id) in self.streams.iter().enumerate() {
+            let indices = self.kernel_indices_for_stream(stream_id);
+            for (list_idx, &kernel_idx) in indices.iter().enumerate() {
+                if self.kernels[kernel_idx]
+                    .name
+                    .to_lowercase()
+                    .contains(&needle)
+                {
+                    self.active_stream_idx = s_idx;
+                    self.rebuild_filter();
+                    self.selected_kernel = list_idx.min(self.filtered_indices.len().saturating_sub(1));
+                    self.search_no_match = false;
+                    return;
+                }
+            }
+        }
+        self.search_no_match = true;
     }
 
     pub fn ensure_active_stream_visible(&mut self, visible_rows: usize) {
@@ -430,5 +488,78 @@ mod tests {
         let (s, e) = kernel_columns(950.0, 1050.0, 1000.0, 1100.0, 100).unwrap();
         assert_eq!(s, 0);
         assert_eq!(e, 50);
+    }
+
+    fn named_kernel(stream: u64, ts: f64, name: &str) -> KernelEvent {
+        KernelEvent {
+            name: name.to_string(),
+            cat: "kernel".to_string(),
+            ts,
+            dur: 5.0,
+            device: 0,
+            stream,
+            grid: None,
+            block: None,
+            shared_memory: None,
+            registers_per_thread: None,
+            correlation: None,
+        }
+    }
+
+    #[test]
+    fn test_search_jumps_to_first_match_across_streams() {
+        let kernels = vec![
+            named_kernel(3, 100.0, "elementwise_add"),
+            named_kernel(3, 200.0, "reduce_sum"),
+            named_kernel(7, 150.0, "volta_sgemm_128"),
+            named_kernel(7, 250.0, "ampere_gemm"),
+        ];
+        let mut app = App::new(kernels);
+        assert_eq!(app.active_stream(), 3);
+
+        app.search_start();
+        assert!(app.search_active);
+
+        app.search_push('v');
+        app.search_push('o');
+        app.search_push('l');
+
+        assert!(!app.search_no_match);
+        assert_eq!(app.active_stream(), 7);
+        assert_eq!(app.selected_event().unwrap().name, "volta_sgemm_128");
+
+        app.search_commit();
+        assert!(!app.search_active);
+        assert_eq!(app.active_stream(), 7);
+    }
+
+    #[test]
+    fn test_search_case_insensitive_and_no_match() {
+        let kernels = vec![
+            named_kernel(3, 100.0, "Reduce_Sum"),
+            named_kernel(7, 150.0, "GEMM"),
+        ];
+        let mut app = App::new(kernels);
+
+        app.search_start();
+        app.search_push('g');
+        app.search_push('e');
+        assert!(!app.search_no_match);
+        assert_eq!(app.selected_event().unwrap().name, "GEMM");
+
+        app.search_push('z');
+        assert!(app.search_no_match);
+    }
+
+    #[test]
+    fn test_search_cancel_resets() {
+        let kernels = vec![named_kernel(3, 100.0, "foo"), named_kernel(7, 150.0, "bar")];
+        let mut app = App::new(kernels);
+        app.search_start();
+        app.search_push('b');
+        assert_eq!(app.active_stream(), 7);
+        app.search_cancel();
+        assert!(!app.search_active);
+        assert!(app.search_query.is_empty());
     }
 }

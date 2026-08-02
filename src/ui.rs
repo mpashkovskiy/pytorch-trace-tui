@@ -71,10 +71,28 @@ fn render_header(frame: &mut Frame, area: Rect, app: &App) {
         Span::styled("Zoom: ", Style::new().fg(Color::DarkGray)),
         Span::styled(app.zoom_label(), Style::new().fg(Color::Magenta).bold()),
         Span::styled(
-            "  [Tab/S-Tab] stream  [A/D] kernel  [W/S] zoom  [Q] quit",
+            "  [/] search  [Tab/S-Tab] stream  [A/D] kernel  [W/S] zoom  [Q] quit",
             Style::new().fg(Color::DarkGray),
         ),
     ]);
+
+    if app.search_active {
+        let prompt_style = if app.search_no_match {
+            Style::new().fg(Color::Red).bold()
+        } else {
+            Style::new().fg(Color::Black).bg(Color::Yellow).bold()
+        };
+        let line = Line::from(vec![
+            Span::styled(" /search: ", Style::new().fg(Color::Black).bg(Color::Yellow).bold()),
+            Span::styled(format!("{}\u{2588}", app.search_query), prompt_style),
+            Span::styled(
+                if app.search_no_match { "  (no match)" } else { "  [Enter] keep  [Esc] cancel" },
+                Style::new().fg(Color::DarkGray),
+            ),
+        ]);
+        frame.render_widget(Paragraph::new(line).style(Style::new().bg(Color::Black)), area);
+        return;
+    }
 
     frame.render_widget(Paragraph::new(line).style(Style::new().bg(Color::Black)), area);
 }

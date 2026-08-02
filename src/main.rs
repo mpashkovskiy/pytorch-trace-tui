@@ -207,8 +207,21 @@ fn event_loop(
         if event::poll(Duration::from_millis(50))? {
             match event::read()? {
                 Event::Key(key) if key.kind == KeyEventKind::Press => {
+                    if app.search_active {
+                        match key.code {
+                            KeyCode::Esc => app.search_cancel(),
+                            KeyCode::Enter => app.search_commit(),
+                            KeyCode::Backspace => app.search_backspace(),
+                            KeyCode::Char(c) => app.search_push(c),
+                            _ => {}
+                        }
+                        continue;
+                    }
                     match key.code {
                         KeyCode::Char('q') | KeyCode::Char('Q') | KeyCode::Esc => break,
+                        KeyCode::Char('/') => {
+                            app.search_start();
+                        }
                         KeyCode::Char('a') | KeyCode::Char('A') | KeyCode::Left => {
                             app.prev_kernel();
                         }
