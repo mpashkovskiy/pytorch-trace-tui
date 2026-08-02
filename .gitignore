@@ -1,0 +1,15 @@
+# Rust build artifacts
+/target
+
+# Backtrace files
+*.rs.bk
+
+# PyTorch profiler traces (large binary data)
+*.pt.trace.json
+*.pt.trace.json.gz
+
+# OS / editor cruft
+.DS_Store
+*.swp
+.idea/
+.vscode/
