@@ -2,10 +2,12 @@ use crate::trace::{AnnotationEvent, KernelEvent};
 
 mod match_blocks;
 mod nw;
+mod pipeline;
 mod warp;
 pub use match_blocks::match_blocks;
 pub use nw::align_block_pair;
-pub use warp::{build_time_maps, map_ts, precompute_display_times};
+pub use pipeline::build_alignment;
+pub use warp::{build_time_maps, precompute_display_times};
 
 #[derive(Debug, Clone)]
 pub struct TimeSegment {
@@ -78,13 +80,6 @@ impl AlignmentState {
     }
 }
 
-pub fn build_alignment(
-    _kernels: &[KernelEvent],
-    _annotations: &[AnnotationEvent],
-    trace_count: usize,
-) -> AlignmentState {
-    AlignmentState::offset_only(0, trace_count)
-}
 
 /// Returns `(raw_start, raw_end, global_index_range)` blocks for one trace.
 /// Primary: split at idle gaps where gap > median_gap * 10.
