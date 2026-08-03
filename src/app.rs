@@ -321,6 +321,7 @@ impl App {
         for meta in &mut self.traces {
             meta.anchor = Some(name.clone());
         }
+        self.alignment = crate::align::AlignmentState::offset_only(0, self.traces.len());
         true
     }
 
@@ -2124,5 +2125,34 @@ mod tests {
     fn test_new_multi_single_trace_offset_only() {
         let app = app_with_annotations();
         assert!(matches!(app.alignment.mode, crate::align::AlignmentMode::OffsetOnly));
+    }
+
+    // G-key after PiecewiseWarp load switches alignment back to OffsetOnly.
+    #[test]
+    fn test_g_key_switches_to_offset_only_and_preserves_shift() {
+        let t0 = trace_of(
+            (0..3).flat_map(|b: usize| {
+                let b0 = b as f64 * 1000.0;
+                vec![kd(1, b0, "gemm", 8.0), kd(1, b0 + 10.0, "relu", 4.0)]
+            }).collect(),
+            vec![],
+        );
+        let t1 = trace_of(
+            (0..3).flat_map(|b: usize| {
+                let b1 = b as f64 * 900.0;
+                vec![kd(1, b1, "gemm", 8.0), kd(1, b1 + 10.0, "relu", 4.0)]
+            }).collect(),
+            vec![],
+        );
+        let mut app = App::new_multi(vec![("T0".into(), t0), ("T1".into(), t1)]);
+        assert!(matches!(app.alignment.mode, crate::align::AlignmentMode::PiecewiseWarp),
+            "should start as PiecewiseWarp");
+
+        let kern_lane = app.lanes.iter().position(|l| l.trace_id() == 0 && !l.is_annotations()).unwrap();
+        app.active_lane = kern_lane;
+        app.selected_item = 0;
+        assert!(app.align_to_selected_kernel(), "G-key align must succeed");
+        assert!(matches!(app.alignment.mode, crate::align::AlignmentMode::OffsetOnly),
+            "G-key must switch to OffsetOnly");
     }
 }
