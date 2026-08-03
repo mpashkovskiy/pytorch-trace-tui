@@ -90,6 +90,7 @@ pub struct App {
     pub search_no_match: bool,
     pub sequence: Option<Sequence>,
     pub sequence_status: Option<String>,
+    pub alignment: crate::align::AlignmentState,
 }
 
 impl App {
@@ -163,6 +164,7 @@ impl App {
             search_no_match: false,
             sequence: None,
             sequence_status: None,
+            alignment: crate::align::AlignmentState::offset_only(0, trace_count),
         };
         app.clamp_selected_item();
         app
@@ -2037,5 +2039,11 @@ mod tests {
         // Common prefix "a" + suffix "c" would leave one empty -> index fallback.
         let labels = vec!["ac".to_string(), "abc".to_string()];
         assert_eq!(shorten_labels(&labels), vec!["T0", "T1"]);
+    }
+
+    #[test]
+    fn test_app_has_offset_only_alignment_by_default() {
+        let app = sample_app();
+        assert!(matches!(app.alignment.mode, crate::align::AlignmentMode::OffsetOnly));
     }
 }
