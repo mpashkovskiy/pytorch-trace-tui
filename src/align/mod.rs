@@ -1,5 +1,8 @@
 use crate::trace::{AnnotationEvent, KernelEvent};
 
+mod match_blocks;
+pub use match_blocks::match_blocks;
+
 #[derive(Debug, Clone)]
 pub struct TimeSegment {
     pub trace_id: usize,
