@@ -10,6 +10,7 @@ pub use pipeline::build_alignment;
 pub use warp::{build_time_maps, precompute_display_times};
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct TimeSegment {
     pub trace_id: usize,
     pub block_id: usize,
@@ -20,6 +21,7 @@ pub struct TimeSegment {
 }
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct TraceTimeMap {
     pub trace_id: usize,
     pub segments: Vec<TimeSegment>,
@@ -32,6 +34,7 @@ pub struct DisplayKernelTime {
 }
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct AlignedTraceBlock {
     pub raw_start: f64,
     pub raw_end: f64,
@@ -54,6 +57,7 @@ pub enum AlignmentMode {
 }
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct AlignmentState {
     pub mode: AlignmentMode,
     pub reference_trace_id: usize,
@@ -101,7 +105,7 @@ pub fn detect_blocks(kernels: &[KernelEvent], trace_id: usize) -> Vec<(f64, f64,
     }
 
     // Compute inter-kernel gaps and their median.
-    let mut gaps: Vec<f64> = indexed
+    let gaps: Vec<f64> = indexed
         .windows(2)
         .map(|w| (w[1].1.ts - w[0].1.end_ts()).max(0.0))
         .collect();

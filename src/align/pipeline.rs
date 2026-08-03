@@ -48,8 +48,7 @@ pub fn build_alignment(
         });
     }
 
-    for tid in 1..trace_count {
-        let other_blocks = &per_trace_blocks[tid];
+    for (tid, other_blocks) in per_trace_blocks.iter().enumerate().skip(1) {
         if other_blocks.is_empty() {
             continue;
         }

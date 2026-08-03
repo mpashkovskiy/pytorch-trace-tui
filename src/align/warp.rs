@@ -1,6 +1,9 @@
 use super::{AlignedBlock, AlignedTraceBlock, DisplayKernelTime, TimeSegment, TraceTimeMap};
 use crate::trace::{AnnotationEvent, KernelEvent};
 
+type DisplayTimes = Vec<Vec<DisplayKernelTime>>;
+type LocalIdx = Vec<usize>;
+
 /// Builds one `TraceTimeMap` per trace from the matched block list.
 /// Each matched per-trace block becomes a `TimeSegment` mapping raw time to
 /// display (reference) time. Unmatched traces get an identity segment so all
@@ -63,12 +66,7 @@ pub fn precompute_display_times(
     kernels: &[KernelEvent],
     annotations: &[AnnotationEvent],
     maps: &[TraceTimeMap],
-) -> (
-    Vec<Vec<DisplayKernelTime>>,
-    Vec<Vec<DisplayKernelTime>>,
-    Vec<usize>,
-    Vec<usize>,
-) {
+) -> (DisplayTimes, DisplayTimes, LocalIdx, LocalIdx) {
     let trace_count = maps.len();
     let mut k_display: Vec<Vec<DisplayKernelTime>> = vec![Vec::new(); trace_count];
     let mut a_display: Vec<Vec<DisplayKernelTime>> = vec![Vec::new(); trace_count];
