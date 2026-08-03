@@ -2,8 +2,10 @@ use crate::trace::{AnnotationEvent, KernelEvent};
 
 mod match_blocks;
 mod nw;
+mod warp;
 pub use match_blocks::match_blocks;
 pub use nw::align_block_pair;
+pub use warp::{build_time_maps, map_ts, precompute_display_times};
 
 #[derive(Debug, Clone)]
 pub struct TimeSegment {
