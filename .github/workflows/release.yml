@@ -2,6 +2,8 @@ name: Release
 
 on:
   push:
+    branches:
+      - master
     tags:
       - "v*"
   workflow_dispatch:
@@ -40,9 +42,29 @@ jobs:
           chmod +x "$ASSET"
           echo "ASSET=${ASSET}" >> "$GITHUB_ENV"
 
+      # Determine the release to publish to:
+      #  - tag push / manual dispatch -> versioned release (that tag)
+      #  - master push                -> rolling "latest" prerelease
+      - name: Resolve release target
+        id: target
+        shell: bash
+        run: |
+          if [ -n "${{ github.event.inputs.tag }}" ]; then
+            echo "tag=${{ github.event.inputs.tag }}" >> "$GITHUB_OUTPUT"
+            echo "prerelease=false" >> "$GITHUB_OUTPUT"
+          elif [ "${{ github.ref_type }}" = "tag" ]; then
+            echo "tag=${{ github.ref_name }}" >> "$GITHUB_OUTPUT"
+            echo "prerelease=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=latest" >> "$GITHUB_OUTPUT"
+            echo "prerelease=true" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Upload to GitHub release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
+          tag_name: ${{ steps.target.outputs.tag }}
+          prerelease: ${{ steps.target.outputs.prerelease }}
+          name: ${{ steps.target.outputs.tag == 'latest' && 'Latest build (master)' || steps.target.outputs.tag }}
           files: ${{ env.ASSET }}
           fail_on_unmatched_files: true

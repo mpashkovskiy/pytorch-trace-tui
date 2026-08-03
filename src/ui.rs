@@ -189,7 +189,7 @@ fn render_header(frame: &mut Frame, area: Rect, app: &App) {
         Span::styled("Zoom: ", Style::new().fg(Color::DarkGray)),
         Span::styled(app.zoom_label(), Style::new().fg(Color::Magenta).bold()),
         Span::styled(
-            "  [/] search  [Tab/S-Tab] lane  [A/D] item  [W/S] zoom  [Q] quit",
+            "  [/] search  [Tab/S-Tab] lane  [A/D] item  [W/S] zoom  [G] align  [Q] quit",
             Style::new().fg(Color::DarkGray),
         ),
     ]);
@@ -216,15 +216,23 @@ fn render_header(frame: &mut Frame, area: Rect, app: &App) {
 }
 
 fn render_lane(frame: &mut Frame, area: Rect, app: &App) {
+    let title = match app.alignment_label() {
+        Some(status) => format!(
+            " {} traces — {} ",
+            app.traces.len(),
+            status
+        ),
+        None => format!(
+            " GPU Streams ({}) — active cuda:{} ",
+            app.streams.len(),
+            app.active_stream()
+        ),
+    };
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(Style::new().fg(Color::Blue))
-        .title(format!(
-            " GPU Streams ({}) — active cuda:{} ",
-            app.streams.len(),
-            app.active_stream()
-        ))
+        .title(title)
         .title_style(Style::new().fg(Color::Cyan).bold());
 
     let inner = block.inner(area);
@@ -246,14 +254,22 @@ fn render_lane(frame: &mut Frame, area: Rect, app: &App) {
     let start = app.lane_view_offset.min(app.lanes.len().saturating_sub(1));
     let end = (start + visible_rows).min(app.lanes.len());
 
+    let multi = app.traces.len() > 1;
+    let short_labels = app.trace_display_labels();
+
     for lane_idx in start..end {
         let lane = &app.lanes[lane_idx];
         let is_active_lane = lane_idx == app.active_lane;
 
-        let label = if lane.is_annotations() {
-            String::new()
+        let trace_prefix = if multi {
+            format!("{} ", short_labels[lane.trace_id()])
         } else {
-            format!("cuda:{}", lane.stream_id())
+            String::new()
+        };
+        let label = if lane.is_annotations() {
+            trace_prefix.trim_end().to_string()
+        } else {
+            format!("{}cuda:{}", trace_prefix, lane.stream_id())
         };
         let label_padded = pad_to(label, label_width - 1);
         let label_style = if is_active_lane {
@@ -274,10 +290,27 @@ fn render_lane(frame: &mut Frame, area: Rect, app: &App) {
 }
 
 fn stream_label_width(app: &App) -> usize {
+    let multi = app.traces.len() > 1;
+    let short_labels = app.trace_display_labels();
     let max = app
-        .streams
+        .lanes
         .iter()
-        .map(|s| format!("cuda:{}", s).chars().count())
+        .map(|lane| {
+            let prefix = if multi {
+                short_labels
+                    .get(lane.trace_id())
+                    .map(|l| l.chars().count() + 1)
+                    .unwrap_or(0)
+            } else {
+                0
+            };
+            let body = if lane.is_annotations() {
+                0
+            } else {
+                format!("cuda:{}", lane.stream_id()).chars().count()
+            };
+            prefix + body
+        })
         .max()
         .unwrap_or(6);
     max + 2
@@ -304,14 +337,19 @@ fn build_lane(
                 let k = &app.kernels[item_idx];
                 (
                     k.name.as_str(),
-                    k.ts,
-                    k.end_ts(),
+                    app.kernel_render_ts(item_idx),
+                    app.kernel_render_end(item_idx),
                     kernel_color(k.cat.as_str(), pos),
                 )
             }
             crate::app::Lane::Annotations { .. } => {
                 let a = &app.annotations[item_idx];
-                (a.name.as_str(), a.ts, a.end_ts(), ann_bg)
+                (
+                    a.name.as_str(),
+                    app.annotation_render_ts(item_idx),
+                    app.annotation_render_end(item_idx),
+                    ann_bg,
+                )
             }
         };
 

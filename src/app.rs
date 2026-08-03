@@ -9,10 +9,12 @@ const ZOOM_FACTOR: f64 = 1.5;
 pub enum Lane {
     Kernels {
         stream_id: u64,
+        trace_id: usize,
         item_indices: Vec<usize>,
     },
     Annotations {
         stream_id: u64,
+        trace_id: usize,
         item_indices: Vec<usize>,
     },
 }
@@ -21,6 +23,12 @@ impl Lane {
     pub fn stream_id(&self) -> u64 {
         match self {
             Lane::Kernels { stream_id, .. } | Lane::Annotations { stream_id, .. } => *stream_id,
+        }
+    }
+
+    pub fn trace_id(&self) -> usize {
+        match self {
+            Lane::Kernels { trace_id, .. } | Lane::Annotations { trace_id, .. } => *trace_id,
         }
     }
 
@@ -44,22 +52,6 @@ pub enum SelectedTraceItem<'a> {
     Annotation(&'a AnnotationEvent),
 }
 
-impl SelectedTraceItem<'_> {
-    pub fn ts(&self) -> f64 {
-        match self {
-            SelectedTraceItem::Kernel(k) => k.ts,
-            SelectedTraceItem::Annotation(a) => a.ts,
-        }
-    }
-
-    pub fn dur(&self) -> f64 {
-        match self {
-            SelectedTraceItem::Kernel(k) => k.dur,
-            SelectedTraceItem::Annotation(a) => a.dur,
-        }
-    }
-}
-
 /// Kernels from the current one up to (exclusive) the next same-named kernel in
 /// the lane. `median` holds per-position median duration across repeated blocks.
 #[derive(Debug, Clone)]
@@ -72,12 +64,23 @@ pub struct Sequence {
     pub scroll: usize,
 }
 
+/// Per-trace metadata for multi-trace alignment. `offset_us` is added to every
+/// raw timestamp of this trace so a shared anchor annotation lines up on the
+/// common time axis.
+#[derive(Debug, Clone)]
+pub struct TraceMeta {
+    pub label: String,
+    pub offset_us: f64,
+    pub anchor: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct App {
     pub kernels: Vec<KernelEvent>,
     pub annotations: Vec<AnnotationEvent>,
     pub streams: Vec<u64>,
     pub lanes: Vec<Lane>,
+    pub traces: Vec<TraceMeta>,
     pub active_lane: usize,
     pub selected_item: usize,
     pub zoom_level: f64,
@@ -90,12 +93,38 @@ pub struct App {
 }
 
 impl App {
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn new(trace: Trace) -> Self {
-        let kernels = trace.kernels;
-        let annotations = trace.annotations;
+        App::new_multi(vec![("T0".to_string(), trace)])
+    }
 
-        // Streams come from BOTH kernels and annotations so annotation-only
-        // streams are never dropped.
+    /// Build an App from one or more labelled traces. Each trace's events are
+    /// stamped with its trace index, alignment offsets are computed from the
+    /// first shared annotation name, and lanes are interleaved round-robin.
+    pub fn new_multi(labelled: Vec<(String, Trace)>) -> Self {
+        let mut kernels: Vec<KernelEvent> = Vec::new();
+        let mut annotations: Vec<AnnotationEvent> = Vec::new();
+        let mut labels: Vec<String> = Vec::new();
+
+        for (trace_id, (label, trace)) in labelled.into_iter().enumerate() {
+            labels.push(label);
+            for mut k in trace.kernels {
+                k.trace_id = trace_id;
+                kernels.push(k);
+            }
+            for mut a in trace.annotations {
+                a.trace_id = trace_id;
+                annotations.push(a);
+            }
+        }
+
+        if labels.is_empty() {
+            labels.push("T0".to_string());
+        }
+        let trace_count = labels.len();
+
+        let traces = compute_alignment(&annotations, &labels);
+
         let mut streams: Vec<u64> = kernels
             .iter()
             .map(|k| k.stream)
@@ -107,7 +136,10 @@ impl App {
             streams.push(0);
         }
 
-        let lanes = build_lanes(&kernels, &annotations, &streams);
+        let per_trace: Vec<Vec<Lane>> = (0..trace_count)
+            .map(|tid| build_trace_lanes(&kernels, &annotations, tid))
+            .collect();
+        let lanes = interleave_lanes(per_trace);
 
         // Start on the first kernel lane so the current selection is a kernel
         // (N / sequence work immediately); fall back to lane 0 if none exist.
@@ -121,6 +153,7 @@ impl App {
             annotations,
             streams,
             lanes,
+            traces,
             active_lane: initial_lane,
             selected_item: 0,
             zoom_level: 1.0,
@@ -166,13 +199,104 @@ impl App {
             .unwrap_or(false)
     }
 
-    /// ts of the item at position `pos` within the given lane, if any.
-    fn item_ts(&self, lane: &Lane, pos: usize) -> Option<f64> {
-        let idx = *lane.item_indices().get(pos)?;
-        match lane {
-            Lane::Kernels { .. } => self.kernels.get(idx).map(|k| k.ts),
-            Lane::Annotations { .. } => self.annotations.get(idx).map(|a| a.ts),
+    fn trace_offset(&self, trace_id: usize) -> f64 {
+        self.traces.get(trace_id).map(|t| t.offset_us).unwrap_or(0.0)
+    }
+
+    /// Aligned start ts of kernel `idx`: raw ts + its trace's alignment offset.
+    pub fn kernel_render_ts(&self, idx: usize) -> f64 {
+        self.kernels
+            .get(idx)
+            .map(|k| k.ts + self.trace_offset(k.trace_id))
+            .unwrap_or(0.0)
+    }
+
+    pub fn kernel_render_end(&self, idx: usize) -> f64 {
+        self.kernels
+            .get(idx)
+            .map(|k| k.end_ts() + self.trace_offset(k.trace_id))
+            .unwrap_or(0.0)
+    }
+
+    pub fn annotation_render_ts(&self, idx: usize) -> f64 {
+        self.annotations
+            .get(idx)
+            .map(|a| a.ts + self.trace_offset(a.trace_id))
+            .unwrap_or(0.0)
+    }
+
+    pub fn annotation_render_end(&self, idx: usize) -> f64 {
+        self.annotations
+            .get(idx)
+            .map(|a| a.end_ts() + self.trace_offset(a.trace_id))
+            .unwrap_or(0.0)
+    }
+
+    /// Human-readable alignment status for the header, or None for a single
+    /// trace where alignment is not meaningful.
+    pub fn alignment_label(&self) -> Option<String> {
+        if self.traces.len() < 2 {
+            return None;
         }
+        match self.traces.first().and_then(|t| t.anchor.as_deref()) {
+            Some(name) => Some(format!("aligned on {:?}", name)),
+            None => Some("not aligned (no shared annotation)".to_string()),
+        }
+    }
+
+    /// Per-trace display labels shortened to their differing part (common prefix
+    /// and suffix stripped), for compact lane labels.
+    pub fn trace_display_labels(&self) -> Vec<String> {
+        let labels: Vec<String> = self.traces.iter().map(|t| t.label.clone()).collect();
+        shorten_labels(&labels)
+    }
+
+    /// Realigns other traces to the currently-selected kernel: the selected
+    /// trace stays fixed, and every other trace is shifted so its same-named
+    /// kernel nearest (by aligned start) to the selection slides onto it. No-op
+    /// unless a kernel is selected. Returns whether an alignment was performed.
+    pub fn align_to_selected_kernel(&mut self) -> bool {
+        let lane = match self.lanes.get(self.active_lane) {
+            Some(l) if !l.is_annotations() => l,
+            _ => return false,
+        };
+        let Some(&kidx) = lane.item_indices().get(self.selected_item) else {
+            return false;
+        };
+        let Some(kernel) = self.kernels.get(kidx) else {
+            return false;
+        };
+        let ref_trace = kernel.trace_id;
+        let name = kernel.name.clone();
+        let target = self.kernel_render_ts(kidx);
+
+        for tid in 0..self.traces.len() {
+            if tid == ref_trace {
+                continue;
+            }
+            let nearest = self
+                .kernels
+                .iter()
+                .enumerate()
+                .filter(|(_, k)| k.trace_id == tid && k.name == name)
+                .map(|(i, _)| self.kernel_render_ts(i))
+                .min_by(|a, b| {
+                    (a - target)
+                        .abs()
+                        .partial_cmp(&(b - target).abs())
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                });
+            if let Some(aligned_start) = nearest {
+                if let Some(meta) = self.traces.get_mut(tid) {
+                    meta.offset_us += target - aligned_start;
+                }
+            }
+        }
+
+        for meta in &mut self.traces {
+            meta.anchor = Some(name.clone());
+        }
+        true
     }
 
     pub fn selected_trace_item(&self) -> Option<SelectedTraceItem<'_>> {
@@ -219,12 +343,36 @@ impl App {
     }
 
     fn move_to_lane(&mut self, target: usize) {
-        let prev_ts = self.selected_trace_item().map(|i| i.ts());
+        let prev_ts = self.selected_item_render_ts();
         self.active_lane = target;
         self.selected_item = match prev_ts {
             Some(ts) => self.nearest_item_in_active_lane(ts),
             None => 0,
         };
+    }
+
+    #[cfg(test)]
+    fn move_to_lane_for_test(&mut self, target: usize) {
+        self.move_to_lane(target);
+    }
+
+    /// Aligned ts of the item at `pos` in `lane` (raw ts + trace offset), so
+    /// cross-trace navigation compares positions on the shared visual axis.
+    fn item_render_ts(&self, lane: &Lane, pos: usize) -> Option<f64> {
+        let idx = *lane.item_indices().get(pos)?;
+        match lane {
+            Lane::Kernels { .. } => {
+                self.kernels.get(idx).map(|_| self.kernel_render_ts(idx))
+            }
+            Lane::Annotations { .. } => {
+                self.annotations.get(idx).map(|_| self.annotation_render_ts(idx))
+            }
+        }
+    }
+
+    fn selected_item_render_ts(&self) -> Option<f64> {
+        let lane = self.lanes.get(self.active_lane)?;
+        self.item_render_ts(lane, self.selected_item)
     }
 
     fn nearest_item_in_active_lane(&self, target_ts: f64) -> usize {
@@ -238,7 +386,7 @@ impl App {
         let mut best = 0usize;
         let mut best_diff = f64::MAX;
         for pos in 0..n {
-            if let Some(ts) = self.item_ts(lane, pos) {
+            if let Some(ts) = self.item_render_ts(lane, pos) {
                 let diff = (ts - target_ts).abs();
                 if diff < best_diff {
                     best_diff = diff;
@@ -477,18 +625,33 @@ impl App {
     pub fn global_time_bounds(&self) -> (f64, f64) {
         let mut min_start = f64::MAX;
         let mut max_end = f64::MIN;
-        for k in &self.kernels {
-            min_start = min_start.min(k.ts);
-            max_end = max_end.max(k.end_ts());
+        for (i, _) in self.kernels.iter().enumerate() {
+            min_start = min_start.min(self.kernel_render_ts(i));
+            max_end = max_end.max(self.kernel_render_end(i));
         }
-        for a in &self.annotations {
-            min_start = min_start.min(a.ts);
-            max_end = max_end.max(a.end_ts());
+        for (i, _) in self.annotations.iter().enumerate() {
+            min_start = min_start.min(self.annotation_render_ts(i));
+            max_end = max_end.max(self.annotation_render_end(i));
         }
         if min_start > max_end {
             (0.0, 1.0)
         } else {
             (min_start, (max_end).max(min_start + 1.0))
+        }
+    }
+
+    /// Aligned center ts of the selected item (raw ts + its trace's offset),
+    /// used to center the visible window on the shared aligned axis.
+    fn selected_render_center(&self) -> Option<f64> {
+        let lane = self.lanes.get(self.active_lane)?;
+        let idx = *lane.item_indices().get(self.selected_item)?;
+        match lane {
+            Lane::Kernels { .. } => {
+                Some((self.kernel_render_ts(idx) + self.kernel_render_end(idx)) / 2.0)
+            }
+            Lane::Annotations { .. } => {
+                Some((self.annotation_render_ts(idx) + self.annotation_render_end(idx)) / 2.0)
+            }
         }
     }
 
@@ -498,8 +661,7 @@ impl App {
         let visible_span = (total_span / self.zoom_level).max(1e-3);
 
         let center = self
-            .selected_trace_item()
-            .map(|i| i.ts() + i.dur() / 2.0)
+            .selected_render_center()
             .unwrap_or(g_start + total_span / 2.0);
 
         let ts_start = (center - visible_span / 2.0).max(g_start);
@@ -518,20 +680,146 @@ impl App {
 }
 
 /// Build the flat, ordered lane list. For each stream (sorted) we emit its
-/// annotation lane first (if it has any annotations) then its kernel lane (if
-/// it has any kernels). Each lane's item indices are sorted by timestamp so
-/// left/right navigation maps to the timeline.
-fn build_lanes(
+/// Earliest start ts of the given annotation name within one trace, if present.
+fn anchor_ts(annotations: &[AnnotationEvent], trace_id: usize, name: &str) -> Option<f64> {
+    annotations
+        .iter()
+        .filter(|a| a.trace_id == trace_id && a.name == name)
+        .map(|a| a.ts)
+        .min_by(|x, y| x.partial_cmp(y).unwrap_or(std::cmp::Ordering::Equal))
+}
+
+/// Computes per-trace alignment offsets. The anchor is the first annotation name
+/// (in trace 0's timestamp order) that appears in EVERY trace; each trace is then
+/// shifted so that anchor's start coincides with trace 0's. If no name is shared,
+/// all offsets are 0 and a warning is emitted to stderr.
+fn compute_alignment(annotations: &[AnnotationEvent], labels: &[String]) -> Vec<TraceMeta> {
+    let trace_count = labels.len();
+
+    let mut t0_names: Vec<&str> = annotations
+        .iter()
+        .filter(|a| a.trace_id == 0)
+        .map(|a| (a.ts, a.name.as_str()))
+        .collect::<Vec<_>>()
+        .into_iter()
+        .fold(Vec::new(), |mut acc, (_, n)| {
+            if !acc.contains(&n) {
+                acc.push(n);
+            }
+            acc
+        });
+    // Order candidate names by earliest occurrence in trace 0.
+    t0_names.sort_by(|a, b| {
+        let ta = anchor_ts(annotations, 0, a).unwrap_or(f64::MAX);
+        let tb = anchor_ts(annotations, 0, b).unwrap_or(f64::MAX);
+        ta.partial_cmp(&tb).unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    let anchor = t0_names.into_iter().find(|name| {
+        (0..trace_count).all(|tid| anchor_ts(annotations, tid, name).is_some())
+    });
+
+    match anchor {
+        Some(name) => {
+            let ref_ts = anchor_ts(annotations, 0, name).unwrap_or(0.0);
+            labels
+                .iter()
+                .enumerate()
+                .map(|(tid, label)| {
+                    let this_ts = anchor_ts(annotations, tid, name).unwrap_or(ref_ts);
+                    TraceMeta {
+                        label: label.clone(),
+                        offset_us: ref_ts - this_ts,
+                        anchor: Some(name.to_string()),
+                    }
+                })
+                .collect()
+        }
+        None => {
+            if trace_count > 1 {
+                eprintln!(
+                    "warning: no annotation name shared across all {} traces; \
+                     rendering without alignment (raw timestamps).",
+                    trace_count
+                );
+            }
+            labels
+                .iter()
+                .map(|label| TraceMeta {
+                    label: label.clone(),
+                    offset_us: 0.0,
+                    anchor: None,
+                })
+                .collect()
+        }
+    }
+}
+
+/// Shortens trace labels to just their differing middle by stripping the common
+/// character prefix and suffix shared by all labels. Falls back to `T{index}`
+/// when there is a single label that would become empty, or when any shortened
+/// label is empty (labels identical, or one is a substring boundary of another).
+fn shorten_labels(labels: &[String]) -> Vec<String> {
+    if labels.len() < 2 {
+        return labels.to_vec();
+    }
+
+    let cols: Vec<Vec<char>> = labels.iter().map(|s| s.chars().collect()).collect();
+    let min_len = cols.iter().map(|c| c.len()).min().unwrap_or(0);
+
+    let mut prefix = 0;
+    while prefix < min_len && cols.iter().all(|c| c[prefix] == cols[0][prefix]) {
+        prefix += 1;
+    }
+
+    let mut suffix = 0;
+    while suffix < min_len - prefix
+        && cols
+            .iter()
+            .all(|c| c[c.len() - 1 - suffix] == cols[0][cols[0].len() - 1 - suffix])
+    {
+        suffix += 1;
+    }
+
+    let shortened: Vec<String> = cols
+        .iter()
+        .map(|c| c[prefix..c.len() - suffix].iter().collect::<String>())
+        .collect();
+
+    if shortened.iter().any(|s| s.is_empty()) {
+        return (0..labels.len()).map(|i| format!("T{}", i)).collect();
+    }
+    shortened
+}
+
+/// Builds the lane list for ONE trace: for each of that trace's streams, an
+/// annotation lane (if any) then a kernel lane (if any). Item indices point into
+/// the shared flat vecs and are filtered by `trace_id`, then sorted by timestamp.
+fn build_trace_lanes(
     kernels: &[KernelEvent],
     annotations: &[AnnotationEvent],
-    streams: &[u64],
+    trace_id: usize,
 ) -> Vec<Lane> {
+    let mut streams: Vec<u64> = kernels
+        .iter()
+        .filter(|k| k.trace_id == trace_id)
+        .map(|k| k.stream)
+        .chain(
+            annotations
+                .iter()
+                .filter(|a| a.trace_id == trace_id)
+                .map(|a| a.stream),
+        )
+        .collect();
+    streams.sort_unstable();
+    streams.dedup();
+
     let mut lanes = Vec::new();
-    for &stream_id in streams {
+    for &stream_id in &streams {
         let mut ann: Vec<usize> = annotations
             .iter()
             .enumerate()
-            .filter(|(_, a)| a.stream == stream_id)
+            .filter(|(_, a)| a.trace_id == trace_id && a.stream == stream_id)
             .map(|(i, _)| i)
             .collect();
         ann.sort_by(|&a, &b| {
@@ -543,6 +831,7 @@ fn build_lanes(
         if !ann.is_empty() {
             lanes.push(Lane::Annotations {
                 stream_id,
+                trace_id,
                 item_indices: ann,
             });
         }
@@ -550,7 +839,7 @@ fn build_lanes(
         let mut kern: Vec<usize> = kernels
             .iter()
             .enumerate()
-            .filter(|(_, k)| k.stream == stream_id)
+            .filter(|(_, k)| k.trace_id == trace_id && k.stream == stream_id)
             .map(|(i, _)| i)
             .collect();
         kern.sort_by(|&a, &b| {
@@ -562,13 +851,31 @@ fn build_lanes(
         if !kern.is_empty() {
             lanes.push(Lane::Kernels {
                 stream_id,
+                trace_id,
                 item_indices: kern,
             });
         }
     }
+    lanes
+}
+
+/// Interleaves per-trace lane lists round-robin by lane index: row 0 of every
+/// trace, then row 1 of every trace, etc. Traces that lack a given row are
+/// skipped, so unequal lane counts collapse gracefully.
+fn interleave_lanes(per_trace: Vec<Vec<Lane>>) -> Vec<Lane> {
+    let max_len = per_trace.iter().map(|l| l.len()).max().unwrap_or(0);
+    let mut lanes = Vec::new();
+    for row in 0..max_len {
+        for trace_lanes in &per_trace {
+            if let Some(lane) = trace_lanes.get(row) {
+                lanes.push(lane.clone());
+            }
+        }
+    }
     if lanes.is_empty() {
         lanes.push(Lane::Kernels {
-            stream_id: streams.first().copied().unwrap_or(0),
+            stream_id: 0,
+            trace_id: 0,
             item_indices: vec![],
         });
     }
@@ -638,6 +945,7 @@ mod tests {
             shared_memory: None,
             registers_per_thread: None,
             correlation: None,
+            trace_id: 0,
         }
     }
 
@@ -654,6 +962,7 @@ mod tests {
             shared_memory: None,
             registers_per_thread: None,
             correlation: None,
+            trace_id: 0,
         }
     }
 
@@ -809,8 +1118,8 @@ mod tests {
             named_kernel(4, 300.0, "kernel_c"),
         ];
         let annotations = vec![
-            AnnotationEvent { name: "ctx_0".to_string(), ts: 90.0, dur: 60.0, stream: 4 },
-            AnnotationEvent { name: "ctx_1".to_string(), ts: 180.0, dur: 40.0, stream: 4 },
+            AnnotationEvent { name: "ctx_0".to_string(), ts: 90.0, dur: 60.0, stream: 4, trace_id: 0 },
+            AnnotationEvent { name: "ctx_1".to_string(), ts: 180.0, dur: 40.0, stream: 4, trace_id: 0 },
         ];
         App::new(Trace { kernels, annotations })
     }
@@ -837,6 +1146,7 @@ mod tests {
             ts: 95.0,
             dur: 20.0,
             stream: 4,
+            trace_id: 0,
         }];
         let mut app = App::new(Trace { kernels, annotations });
         assert_eq!(app.lanes.len(), 3);
@@ -927,6 +1237,7 @@ mod tests {
             ts: 50.0,
             dur: 10.0,
             stream: 9,
+            trace_id: 0,
         }];
         let app = App::new(Trace { kernels, annotations });
         assert_eq!(app.streams, vec![1, 9]);
@@ -946,6 +1257,7 @@ mod tests {
             ts: 0.0,
             dur: 1.0,
             stream: 2,
+            trace_id: 0,
         }];
         let app = App::new(Trace { kernels, annotations });
         // stream 1: 1 lane (kernels). stream 2: 2 lanes (annotations + kernels).
@@ -1120,6 +1432,7 @@ mod tests {
             shared_memory: None,
             registers_per_thread: None,
             correlation: None,
+            trace_id: 0,
         }
     }
 
@@ -1357,5 +1670,372 @@ mod tests {
         assert!(outcome.file_path.exists());
         assert_eq!(std::fs::read_to_string(&outcome.file_path).unwrap(), csv);
         let _ = std::fs::remove_file(&outcome.file_path);
+    }
+
+    // ── Multi-trace alignment + interleaving ─────────────────────────────────
+
+    fn ann(stream: u64, ts: f64, name: &str) -> AnnotationEvent {
+        AnnotationEvent {
+            name: name.to_string(),
+            ts,
+            dur: 1.0,
+            stream,
+            trace_id: 0,
+        }
+    }
+
+    fn trace_of(kernels: Vec<KernelEvent>, annotations: Vec<AnnotationEvent>) -> Trace {
+        Trace {
+            kernels,
+            annotations,
+        }
+    }
+
+    // S1: two traces share annotation "step" at different abs ts -> aligned
+    // render_ts of that annotation is equal across both traces.
+    #[test]
+    fn test_alignment_offsets_anchor_on_first_shared_annotation() {
+        let t0 = trace_of(vec![kd(1, 100.0, "foo", 5.0)], vec![ann(1, 100.0, "step")]);
+        let t1 = trace_of(vec![kd(1, 500.0, "foo", 5.0)], vec![ann(1, 500.0, "step")]);
+        let app = App::new_multi(vec![("T0".into(), t0), ("T1".into(), t1)]);
+
+        assert_eq!(app.traces.len(), 2);
+        assert_eq!(app.traces[0].offset_us, 0.0, "reference trace offset is 0");
+        assert_eq!(app.traces[1].offset_us, -400.0, "shift t1 back by 400");
+        assert_eq!(app.traces[0].anchor.as_deref(), Some("step"));
+
+        // Aligned anchor timestamps coincide.
+        let a0 = app
+            .annotations
+            .iter()
+            .find(|a| a.trace_id == 0 && a.name == "step")
+            .unwrap();
+        let a1 = app
+            .annotations
+            .iter()
+            .find(|a| a.trace_id == 1 && a.name == "step")
+            .unwrap();
+        let r0 = a0.ts + app.traces[0].offset_us;
+        let r1 = a1.ts + app.traces[1].offset_us;
+        assert!((r0 - r1).abs() < 1e-9, "anchor aligned: {} vs {}", r0, r1);
+    }
+
+    // S1b: the render-ts accessors add the per-trace offset to raw ts.
+    #[test]
+    fn test_render_ts_accessors_apply_offset() {
+        let t0 = trace_of(vec![kd(1, 100.0, "foo", 5.0)], vec![ann(1, 100.0, "step")]);
+        let t1 = trace_of(vec![kd(1, 500.0, "bar", 7.0)], vec![ann(1, 500.0, "step")]);
+        let app = App::new_multi(vec![("T0".into(), t0), ("T1".into(), t1)]);
+
+        let k1 = app.kernels.iter().position(|k| k.trace_id == 1).unwrap();
+        // raw 500 + offset -400 = 100
+        assert!((app.kernel_render_ts(k1) - 100.0).abs() < 1e-9);
+        assert!((app.kernel_render_end(k1) - 107.0).abs() < 1e-9);
+    }
+
+    // S2: interleave order = row0 of every trace, then row1, etc. with correct
+    // trace_id per lane.
+    #[test]
+    fn test_lanes_interleaved_by_row_across_traces() {
+        // Each trace: stream 1 has kernels only -> 1 lane per trace.
+        let t0 = trace_of(vec![kd(1, 0.0, "a", 1.0), kd(2, 0.0, "b", 1.0)], vec![]);
+        let t1 = trace_of(vec![kd(1, 0.0, "c", 1.0), kd(2, 0.0, "d", 1.0)], vec![]);
+        let app = App::new_multi(vec![("T0".into(), t0), ("T1".into(), t1)]);
+
+        // t0 has 2 lanes (stream1, stream2), t1 has 2 lanes -> interleave:
+        // [t0.row0, t1.row0, t0.row1, t1.row1]
+        assert_eq!(app.lanes.len(), 4);
+        assert_eq!(app.lanes[0].trace_id(), 0);
+        assert_eq!(app.lanes[1].trace_id(), 1);
+        assert_eq!(app.lanes[2].trace_id(), 0);
+        assert_eq!(app.lanes[3].trace_id(), 1);
+        assert_eq!(app.lanes[0].stream_id(), 1);
+        assert_eq!(app.lanes[1].stream_id(), 1);
+        assert_eq!(app.lanes[2].stream_id(), 2);
+        assert_eq!(app.lanes[3].stream_id(), 2);
+    }
+
+    // S3: no shared annotation name -> all offsets 0, lanes still interleaved.
+    #[test]
+    fn test_no_common_annotation_falls_back_to_zero_offset() {
+        let t0 = trace_of(vec![kd(1, 100.0, "a", 1.0)], vec![ann(1, 100.0, "alpha")]);
+        let t1 = trace_of(vec![kd(1, 500.0, "b", 1.0)], vec![ann(1, 500.0, "beta")]);
+        let app = App::new_multi(vec![("T0".into(), t0), ("T1".into(), t1)]);
+
+        assert_eq!(app.traces[0].offset_us, 0.0);
+        assert_eq!(app.traces[1].offset_us, 0.0);
+        assert!(app.traces[0].anchor.is_none(), "no anchor chosen");
+        // Each trace: annotation lane + kernel lane = 2 lanes; interleaved = 4,
+        // in [t0.ann, t1.ann, t0.kern, t1.kern] order.
+        assert_eq!(app.lanes.len(), 4, "still interleaved by row across traces");
+        assert_eq!(app.lanes[0].trace_id(), 0);
+        assert_eq!(app.lanes[1].trace_id(), 1);
+        assert!(app.lanes[0].is_annotations());
+        assert!(app.lanes[1].is_annotations());
+        assert!(!app.lanes[2].is_annotations());
+        assert!(!app.lanes[3].is_annotations());
+    }
+
+    // S4: unequal lane counts -> round-robin to max, skip missing rows.
+    #[test]
+    fn test_unequal_lane_counts_round_robin_skips_missing() {
+        // t0: 3 streams -> 3 lanes. t1: 1 stream -> 1 lane.
+        let t0 = trace_of(
+            vec![
+                kd(1, 0.0, "a", 1.0),
+                kd(2, 0.0, "b", 1.0),
+                kd(3, 0.0, "c", 1.0),
+            ],
+            vec![],
+        );
+        let t1 = trace_of(vec![kd(1, 0.0, "d", 1.0)], vec![]);
+        let app = App::new_multi(vec![("T0".into(), t0), ("T1".into(), t1)]);
+
+        // Expected: [t0.row0, t1.row0, t0.row1, t0.row2]
+        assert_eq!(app.lanes.len(), 4);
+        assert_eq!(app.lanes[0].trace_id(), 0);
+        assert_eq!(app.lanes[1].trace_id(), 1);
+        assert_eq!(app.lanes[2].trace_id(), 0);
+        assert_eq!(app.lanes[3].trace_id(), 0);
+    }
+
+    // S5 regression: single-trace App::new behaves as before (offset 0, 1 trace).
+    #[test]
+    fn test_single_trace_regression_offsets_and_lanes() {
+        let app = app_with_annotations();
+        assert_eq!(app.traces.len(), 1);
+        assert_eq!(app.traces[0].offset_us, 0.0);
+        // Same lane layout as before: annotation lane + kernel lane for stream 4.
+        assert_eq!(app.lanes.len(), 2);
+        assert!(app.lanes.iter().all(|l| l.trace_id() == 0));
+    }
+
+    // S1c: global_time_bounds spans the ALIGNED window across traces, so the far
+    // trace's shifted events fall inside the reference trace's coordinate range.
+    #[test]
+    fn test_global_bounds_use_aligned_timestamps() {
+        // t0 anchor "step" at 100; t1 anchor at 500 -> offset -400.
+        // t1 kernel raw 500 -> aligned 100, so aligned max end ~ 105, not 505.
+        let t0 = trace_of(vec![kd(1, 100.0, "foo", 5.0)], vec![ann(1, 100.0, "step")]);
+        let t1 = trace_of(vec![kd(1, 500.0, "bar", 5.0)], vec![ann(1, 500.0, "step")]);
+        let app = App::new_multi(vec![("T0".into(), t0), ("T1".into(), t1)]);
+        let (g_start, g_end) = app.global_time_bounds();
+        // Both traces' aligned events sit near ts=100..105.
+        assert!((g_start - 100.0).abs() < 1e-9, "start {}", g_start);
+        assert!(g_end <= 106.0, "aligned end should be ~105 not 505, got {}", g_end);
+    }
+
+    // Alignment label surfaces the chosen anchor for multi-trace, empty otherwise.
+    #[test]
+    fn test_alignment_label_reports_anchor() {
+        let t0 = trace_of(vec![kd(1, 100.0, "foo", 5.0)], vec![ann(1, 100.0, "step")]);
+        let t1 = trace_of(vec![kd(1, 500.0, "bar", 5.0)], vec![ann(1, 500.0, "step")]);
+        let app = App::new_multi(vec![("T0".into(), t0), ("T1".into(), t1)]);
+        assert_eq!(app.alignment_label().as_deref(), Some("aligned on \"step\""));
+
+        let single = app_with_annotations();
+        assert!(single.alignment_label().is_none(), "single trace: no label");
+
+        let d0 = trace_of(vec![kd(1, 1.0, "a", 1.0)], vec![ann(1, 1.0, "x")]);
+        let d1 = trace_of(vec![kd(1, 9.0, "b", 1.0)], vec![ann(1, 9.0, "y")]);
+        let disjoint = App::new_multi(vec![("T0".into(), d0), ("T1".into(), d1)]);
+        assert_eq!(
+            disjoint.alignment_label().as_deref(),
+            Some("not aligned (no shared annotation)")
+        );
+    }
+
+    // Tabbing across offset traces lands on the ALIGNED-nearest item, so the
+    // visually-adjacent kernel is selected (this feature is for visual compare).
+    #[test]
+    fn test_tab_across_traces_uses_aligned_position() {
+        // t0: foo@100, bar@200 (anchor@100). t1: foo@9100->200, bar@9200->300 (anchor@9000).
+        let t0 = trace_of(
+            vec![kd(1, 100.0, "foo", 5.0), kd(1, 200.0, "bar", 5.0)],
+            vec![ann(1, 100.0, "step")],
+        );
+        let t1 = trace_of(
+            vec![kd(1, 9100.0, "foo", 5.0), kd(1, 9200.0, "bar", 5.0)],
+            vec![ann(1, 9000.0, "step")],
+        );
+        let mut app = App::new_multi(vec![("T0".into(), t0), ("T1".into(), t1)]);
+
+        let bar_lane = app
+            .lanes
+            .iter()
+            .position(|l| {
+                l.trace_id() == 0
+                    && !l.is_annotations()
+                    && l.item_indices()
+                        .iter()
+                        .any(|&i| app.kernels[i].name == "bar")
+            })
+            .unwrap();
+        app.active_lane = bar_lane;
+        let bar_pos = app.lanes[bar_lane]
+            .item_indices()
+            .iter()
+            .position(|&i| app.kernels[i].name == "bar")
+            .unwrap();
+        app.selected_item = bar_pos;
+
+        let t1_kern_lane = app
+            .lanes
+            .iter()
+            .position(|l| l.trace_id() == 1 && !l.is_annotations())
+            .unwrap();
+        app.move_to_lane_for_test(t1_kern_lane);
+        let sel = app.selected_trace_item().unwrap();
+        match sel {
+            // Aligned-nearest to 200 is t1.foo (aligned 200), not t1.bar (aligned 300).
+            SelectedTraceItem::Kernel(k) => assert_eq!(k.name, "foo"),
+            _ => panic!("expected kernel"),
+        }
+    }
+
+    // ── Dynamic align to the selected kernel (g key) ─────────────────────────
+
+    /// Aligned start ts of trace `tid`'s nearest same-named kernel to `target`.
+    fn nearest_same_name_aligned(app: &App, tid: usize, name: &str, target: f64) -> Option<f64> {
+        app.kernels
+            .iter()
+            .enumerate()
+            .filter(|(_, k)| k.trace_id == tid && k.name == name)
+            .map(|(i, _)| app.kernel_render_ts(i))
+            .min_by(|a, b| {
+                (a - target)
+                    .abs()
+                    .partial_cmp(&(b - target).abs())
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+    }
+
+    fn select_kernel(app: &mut App, tid: usize, name: &str) {
+        let lane = app
+            .lanes
+            .iter()
+            .position(|l| {
+                l.trace_id() == tid
+                    && !l.is_annotations()
+                    && l.item_indices().iter().any(|&i| app.kernels[i].name == name)
+            })
+            .unwrap();
+        let pos = app.lanes[lane]
+            .item_indices()
+            .iter()
+            .position(|&i| app.kernels[i].name == name)
+            .unwrap();
+        app.active_lane = lane;
+        app.selected_item = pos;
+    }
+
+    // S1: aligning to a selected kernel shifts other traces so their nearest
+    // same-named kernel's start coincides with the selected kernel's start.
+    #[test]
+    fn test_align_to_selected_kernel_shifts_others() {
+        // No shared annotation -> load offsets are 0; both traces raw.
+        // t0: gemm@200. t1: gemm@700. Selecting t0.gemm and aligning moves t1
+        // so t1.gemm aligned start == 200.
+        let t0 = trace_of(vec![kd(1, 200.0, "gemm", 8.0)], vec![]);
+        let t1 = trace_of(vec![kd(1, 700.0, "gemm", 8.0)], vec![]);
+        let mut app = App::new_multi(vec![("T0".into(), t0), ("T1".into(), t1)]);
+        assert_eq!(app.traces[1].offset_us, 0.0, "no annotation -> load offset 0");
+
+        select_kernel(&mut app, 0, "gemm");
+        let ok = app.align_to_selected_kernel();
+        assert!(ok, "align succeeds on a selected kernel");
+
+        // Selected trace unchanged; t1 shifted so its gemm sits at 200.
+        assert_eq!(app.traces[0].offset_us, 0.0, "selected/reference trace fixed");
+        assert_eq!(app.traces[1].offset_us, -500.0, "t1 shifts by 200-700");
+        let t1_gemm = app.kernels.iter().position(|k| k.trace_id == 1).unwrap();
+        assert!((app.kernel_render_ts(t1_gemm) - 200.0).abs() < 1e-9);
+        // Header anchor reflects the kernel used.
+        assert_eq!(app.alignment_label().as_deref(), Some("aligned on \"gemm\""));
+        let _ = nearest_same_name_aligned(&app, 1, "gemm", 200.0);
+    }
+
+    // S2: when a trace has multiple same-named kernels, align picks the one
+    // whose aligned start is NEAREST to the selected kernel, not the first.
+    #[test]
+    fn test_align_picks_nearest_same_named_kernel() {
+        // t0: bar@500 selected. t1 has gemm@100, bar@480, bar@900.
+        // Nearest bar to 500 is 480 -> shift by 500-480 = +20.
+        let t0 = trace_of(vec![kd(1, 500.0, "bar", 5.0)], vec![]);
+        let t1 = trace_of(
+            vec![
+                kd(1, 100.0, "gemm", 5.0),
+                kd(1, 480.0, "bar", 5.0),
+                kd(1, 900.0, "bar", 5.0),
+            ],
+            vec![],
+        );
+        let mut app = App::new_multi(vec![("T0".into(), t0), ("T1".into(), t1)]);
+        select_kernel(&mut app, 0, "bar");
+        assert!(app.align_to_selected_kernel());
+        assert_eq!(app.traces[1].offset_us, 20.0, "nearest bar (480) -> +20");
+    }
+
+    // S3: aligning when another trace has NO same-named kernel leaves that trace
+    // untouched (no panic, offset unchanged).
+    #[test]
+    fn test_align_no_match_leaves_trace_untouched() {
+        let t0 = trace_of(vec![kd(1, 200.0, "gemm", 5.0)], vec![]);
+        let t1 = trace_of(vec![kd(1, 700.0, "relu", 5.0)], vec![]);
+        let mut app = App::new_multi(vec![("T0".into(), t0), ("T1".into(), t1)]);
+        select_kernel(&mut app, 0, "gemm");
+        assert!(app.align_to_selected_kernel());
+        assert_eq!(app.traces[1].offset_us, 0.0, "no 'gemm' in t1 -> unchanged");
+    }
+
+    // S4: aligning with an annotation (non-kernel) selected is a no-op.
+    #[test]
+    fn test_align_noop_when_selection_not_kernel() {
+        let t0 = trace_of(vec![kd(1, 100.0, "k", 5.0)], vec![ann(1, 90.0, "ctx")]);
+        let t1 = trace_of(vec![kd(1, 900.0, "k", 5.0)], vec![ann(1, 800.0, "ctx")]);
+        let mut app = App::new_multi(vec![("T0".into(), t0), ("T1".into(), t1)]);
+        let load_offset = app.traces[1].offset_us;
+        // Select the annotation lane.
+        let ann_lane = app.lanes.iter().position(|l| l.is_annotations()).unwrap();
+        app.active_lane = ann_lane;
+        app.selected_item = 0;
+        assert!(!app.align_to_selected_kernel(), "no-op on annotation");
+        assert_eq!(app.traces[1].offset_us, load_offset, "offsets unchanged");
+    }
+
+    // ── Short trace labels (strip common prefix + suffix) ────────────────────
+
+    #[test]
+    fn test_short_labels_strip_common_prefix_and_suffix() {
+        let labels = vec![
+            "resnet_baseline.pt.trace.json".to_string(),
+            "resnet_tuned.pt.trace.json".to_string(),
+        ];
+        assert_eq!(shorten_labels(&labels), vec!["baseline", "tuned"]);
+    }
+
+    #[test]
+    fn test_short_labels_prefix_only() {
+        let labels = vec!["run_a".to_string(), "run_bb".to_string()];
+        assert_eq!(shorten_labels(&labels), vec!["a", "bb"]);
+    }
+
+    #[test]
+    fn test_short_labels_identical_fall_back_to_index() {
+        let labels = vec!["same.json".to_string(), "same.json".to_string()];
+        assert_eq!(shorten_labels(&labels), vec!["T0", "T1"]);
+    }
+
+    #[test]
+    fn test_short_labels_single_unchanged() {
+        let labels = vec!["only_one.json".to_string()];
+        assert_eq!(shorten_labels(&labels), vec!["only_one.json"]);
+    }
+
+    #[test]
+    fn test_short_labels_empty_diff_falls_back_to_index() {
+        // Common prefix "a" + suffix "c" would leave one empty -> index fallback.
+        let labels = vec!["ac".to_string(), "abc".to_string()];
+        assert_eq!(shorten_labels(&labels), vec!["T0", "T1"]);
     }
 }

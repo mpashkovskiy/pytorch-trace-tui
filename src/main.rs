@@ -24,47 +24,86 @@ use std::time::Duration;
     version
 )]
 struct Cli {
-    /// Trace file path; if omitted, scans the current dir for *.pt.trace.json.gz
-    trace: Option<String>,
+    /// Trace file path(s). Pass two or more to overlay and align them by
+    /// gpu_user_annotation. If omitted, scans the current dir for *.pt.trace.json.gz
+    traces: Vec<String>,
+}
+
+fn trace_label(path: &str, _index: usize) -> String {
+    std::path::Path::new(path)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .map(|n| n.trim_end_matches(".gz").trim_end_matches(".json").trim_end_matches(".pt.trace"))
+        .filter(|s| !s.is_empty())
+        .unwrap_or("trace")
+        .to_string()
 }
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    let trace_path = match cli.trace {
-        Some(path) => path,
-        None => match select_trace_interactively()? {
-            Some(path) => path,
+    let paths: Vec<String> = if cli.traces.is_empty() {
+        match select_trace_interactively()? {
+            Some(paths) => paths,
             None => return Ok(()),
-        },
+        }
+    } else {
+        cli.traces
     };
 
-    let trace = trace::parse_trace(&trace_path)
-        .with_context(|| format!("Failed to load trace: {}", trace_path))?;
+    let mut labelled: Vec<(String, trace::Trace)> = Vec::new();
+    let mut total_kernels = 0usize;
+    let mut total_annotations = 0usize;
+    for (index, path) in paths.iter().enumerate() {
+        let trace = trace::parse_trace(path)
+            .with_context(|| format!("Failed to load trace: {}", path))?;
+        total_kernels += trace.kernels.len();
+        total_annotations += trace.annotations.len();
+        labelled.push((trace_label(path, index), trace));
+    }
 
-    if trace.kernels.is_empty() {
-        println!("No GPU kernels found in trace file: {}", trace_path);
+    if total_kernels == 0 {
+        println!("No GPU kernels found in trace file(s): {}", paths.join(", "));
         return Ok(());
     }
 
-    let stream_count = {
-        let mut s: Vec<u64> = trace.kernels.iter().map(|k| k.stream).collect();
-        s.sort_unstable();
-        s.dedup();
-        s.len()
-    };
     eprintln!(
-        "Loaded {} GPU kernels ({} annotations) across {} stream(s). Starting TUI...",
-        trace.kernels.len(),
-        trace.annotations.len(),
-        stream_count
+        "Loaded {} GPU kernels ({} annotations) from {} trace(s). Starting TUI...",
+        total_kernels,
+        total_annotations,
+        paths.len()
     );
 
-    let app = App::new(trace);
+    let app = App::new_multi(labelled);
     run_tui(app)
 }
 
-fn select_trace_interactively() -> Result<Option<String>> {
+/// Parses a picker selection line into 1-based indices. Accepts space- and/or
+/// comma-separated numbers (e.g. "1 3", "1,3", "2, 4 5"). Returns None for an
+/// empty line or a quit request ("q"); Err on any non-numeric or out-of-range
+/// token. Duplicates are preserved in the order given.
+fn parse_selection(input: &str, count: usize) -> Result<Option<Vec<usize>>> {
+    let input = input.trim().trim_matches(char::from(0));
+    if input.is_empty() || input.eq_ignore_ascii_case("q") {
+        return Ok(None);
+    }
+    let mut chosen = Vec::new();
+    for tok in input.split([' ', ',']).filter(|t| !t.is_empty()) {
+        let n: usize = tok
+            .parse()
+            .map_err(|_| anyhow::anyhow!("Invalid selection: {}", tok))?;
+        if n < 1 || n > count {
+            bail!("Selection out of range: {}", n);
+        }
+        chosen.push(n);
+    }
+    if chosen.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(chosen))
+}
+
+fn select_trace_interactively() -> Result<Option<Vec<String>>> {
     let mut traces: Vec<(PathBuf, std::time::SystemTime, u64)> = std::fs::read_dir(".")
         .context("Failed to read current directory")?
         .filter_map(|entry| entry.ok().map(|e| e.path()))
@@ -88,13 +127,16 @@ fn select_trace_interactively() -> Result<Option<String>> {
 
     traces.sort_by(|a, b| b.1.cmp(&a.1));
 
-    println!("Select a trace to open:");
+    println!("Select trace(s) to open:");
     for (i, (path, mtime, size)) in traces.iter().enumerate() {
         let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("?");
         let dt = format_mtime(*mtime);
         println!("  [{}] {}  {}  {}", i + 1, dt, human_size(*size), name);
     }
-    print!("Enter number (1-{}, or q to quit): ", traces.len());
+    print!(
+        "Enter number(s) (e.g. 1 or '1 3' to overlay, 1-{}, or q to quit): ",
+        traces.len()
+    );
     stdout().flush().ok();
 
     let mut raw = Vec::new();
@@ -103,20 +145,16 @@ fn select_trace_interactively() -> Result<Option<String>> {
         .read_until(b'\n', &mut raw)
         .context("Failed to read selection")?;
     let decoded = String::from_utf8_lossy(&raw);
-    let input = decoded.trim().trim_matches(char::from(0));
 
-    if input.eq_ignore_ascii_case("q") || input.is_empty() {
-        return Ok(None);
+    match parse_selection(&decoded, traces.len())? {
+        None => Ok(None),
+        Some(choices) => Ok(Some(
+            choices
+                .into_iter()
+                .map(|c| traces[c - 1].0.to_string_lossy().into_owned())
+                .collect(),
+        )),
     }
-
-    let choice: usize = input
-        .parse()
-        .map_err(|_| anyhow::anyhow!("Invalid selection: {}", input))?;
-    if choice < 1 || choice > traces.len() {
-        bail!("Selection out of range: {}", choice);
-    }
-
-    Ok(Some(traces[choice - 1].0.to_string_lossy().into_owned()))
 }
 
 fn format_mtime(t: std::time::SystemTime) -> String {
@@ -276,6 +314,9 @@ fn event_loop(
                         KeyCode::Char('n') | KeyCode::Char('N') => {
                             app.start_sequence();
                         }
+                        KeyCode::Char('g') | KeyCode::Char('G') => {
+                            app.align_to_selected_kernel();
+                        }
                         KeyCode::Char('a') | KeyCode::Char('A') | KeyCode::Left => {
                             app.prev_item();
                         }
@@ -315,4 +356,55 @@ fn sequence_viewport(term_height: usize, app: &App) -> usize {
     let inner = popup_h.saturating_sub(2);
     let footer_reserved = 3 + usize::from(app.sequence_status.is_some());
     inner.saturating_sub(1 + footer_reserved).max(1)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_selection;
+
+    #[test]
+    fn single_number() {
+        assert_eq!(parse_selection("2", 5).unwrap(), Some(vec![2]));
+    }
+
+    #[test]
+    fn space_separated_multi() {
+        assert_eq!(parse_selection("1 3", 5).unwrap(), Some(vec![1, 3]));
+    }
+
+    #[test]
+    fn comma_separated_multi() {
+        assert_eq!(parse_selection("2,4,5", 5).unwrap(), Some(vec![2, 4, 5]));
+    }
+
+    #[test]
+    fn mixed_separators_and_spacing() {
+        assert_eq!(parse_selection(" 2, 4 5 ", 5).unwrap(), Some(vec![2, 4, 5]));
+    }
+
+    #[test]
+    fn quit_and_empty_return_none() {
+        assert_eq!(parse_selection("q", 5).unwrap(), None);
+        assert_eq!(parse_selection("Q", 5).unwrap(), None);
+        assert_eq!(parse_selection("", 5).unwrap(), None);
+        assert_eq!(parse_selection("   ", 5).unwrap(), None);
+    }
+
+    #[test]
+    fn out_of_range_is_error() {
+        assert!(parse_selection("0", 5).is_err());
+        assert!(parse_selection("6", 5).is_err());
+        assert!(parse_selection("1 9", 5).is_err());
+    }
+
+    #[test]
+    fn non_numeric_is_error() {
+        assert!(parse_selection("1 x", 5).is_err());
+        assert!(parse_selection("abc", 5).is_err());
+    }
+
+    #[test]
+    fn duplicates_preserved_in_order() {
+        assert_eq!(parse_selection("3 1 3", 5).unwrap(), Some(vec![3, 1, 3]));
+    }
 }

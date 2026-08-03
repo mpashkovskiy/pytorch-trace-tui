@@ -39,6 +39,8 @@ pub struct KernelEvent {
     pub shared_memory: Option<u64>,
     pub registers_per_thread: Option<u64>,
     pub correlation: Option<u64>,
+    #[serde(default)]
+    pub trace_id: usize,
 }
 
 impl KernelEvent {
@@ -53,6 +55,8 @@ pub struct AnnotationEvent {
     pub ts: f64,
     pub dur: f64,
     pub stream: u64,
+    #[serde(default)]
+    pub trace_id: usize,
 }
 
 impl AnnotationEvent {
@@ -421,6 +425,7 @@ fn classify(e: RawEvent) -> Option<Parsed> {
             ts,
             dur,
             stream,
+            trace_id: 0,
         }));
     }
 
@@ -449,6 +454,7 @@ fn classify(e: RawEvent) -> Option<Parsed> {
         shared_memory,
         registers_per_thread,
         correlation,
+        trace_id: 0,
     }))
 }
 
