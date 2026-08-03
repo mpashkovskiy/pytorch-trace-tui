@@ -1,3 +1,4 @@
+mod align;
 mod app;
 mod clipboard;
 mod trace;
