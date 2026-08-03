@@ -1,0 +1,48 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to build (e.g. v0.1.0). Attaches the binary to that release."
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build x86_64 Ubuntu 24.04 binary
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install clipboard system deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libxcb1-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev
+
+      - name: Build release binary
+        run: cargo build --release --locked
+
+      - name: Rename binary with target triple
+        shell: bash
+        run: |
+          BIN=pytorch-trace-tui
+          ASSET="${BIN}-x86_64-unknown-linux-gnu"
+          cp "target/release/${BIN}" "$ASSET"
+          chmod +x "$ASSET"
+          echo "ASSET=${ASSET}" >> "$GITHUB_ENV"
+
+      - name: Upload to GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
+          files: ${{ env.ASSET }}
+          fail_on_unmatched_files: true
