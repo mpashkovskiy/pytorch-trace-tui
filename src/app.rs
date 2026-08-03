@@ -149,6 +149,8 @@ impl App {
             .position(|l| !l.is_annotations())
             .unwrap_or(0);
 
+        let alignment = crate::align::build_alignment(&kernels, &annotations, trace_count);
+
         let mut app = App {
             kernels,
             annotations,
@@ -164,7 +166,7 @@ impl App {
             search_no_match: false,
             sequence: None,
             sequence_status: None,
-            alignment: crate::align::AlignmentState::offset_only(0, trace_count),
+            alignment,
         };
         app.clamp_selected_item();
         app
@@ -205,33 +207,54 @@ impl App {
         self.traces.get(trace_id).map(|t| t.offset_us).unwrap_or(0.0)
     }
 
-    /// Aligned start ts of kernel `idx`: raw ts + its trace's alignment offset.
+    /// Aligned start ts of kernel `idx`: uses piecewise display times when
+    /// available, otherwise falls back to raw ts + trace offset.
     pub fn kernel_render_ts(&self, idx: usize) -> f64 {
-        self.kernels
-            .get(idx)
-            .map(|k| k.ts + self.trace_offset(k.trace_id))
-            .unwrap_or(0.0)
+        let Some(k) = self.kernels.get(idx) else { return 0.0; };
+        if let crate::align::AlignmentMode::PiecewiseWarp = self.alignment.mode {
+            let li = self.alignment.kernel_local_idx.get(idx).copied().unwrap_or(0);
+            if let Some(dt) = self.alignment.display_kernel_times
+                .get(k.trace_id).and_then(|v| v.get(li)) {
+                return dt.display_start;
+            }
+        }
+        k.ts + self.trace_offset(k.trace_id)
     }
 
     pub fn kernel_render_end(&self, idx: usize) -> f64 {
-        self.kernels
-            .get(idx)
-            .map(|k| k.end_ts() + self.trace_offset(k.trace_id))
-            .unwrap_or(0.0)
+        let Some(k) = self.kernels.get(idx) else { return 0.0; };
+        if let crate::align::AlignmentMode::PiecewiseWarp = self.alignment.mode {
+            let li = self.alignment.kernel_local_idx.get(idx).copied().unwrap_or(0);
+            if let Some(dt) = self.alignment.display_kernel_times
+                .get(k.trace_id).and_then(|v| v.get(li)) {
+                return dt.display_end;
+            }
+        }
+        k.end_ts() + self.trace_offset(k.trace_id)
     }
 
     pub fn annotation_render_ts(&self, idx: usize) -> f64 {
-        self.annotations
-            .get(idx)
-            .map(|a| a.ts + self.trace_offset(a.trace_id))
-            .unwrap_or(0.0)
+        let Some(a) = self.annotations.get(idx) else { return 0.0; };
+        if let crate::align::AlignmentMode::PiecewiseWarp = self.alignment.mode {
+            let li = self.alignment.annotation_local_idx.get(idx).copied().unwrap_or(0);
+            if let Some(dt) = self.alignment.display_annotation_times
+                .get(a.trace_id).and_then(|v| v.get(li)) {
+                return dt.display_start;
+            }
+        }
+        a.ts + self.trace_offset(a.trace_id)
     }
 
     pub fn annotation_render_end(&self, idx: usize) -> f64 {
-        self.annotations
-            .get(idx)
-            .map(|a| a.end_ts() + self.trace_offset(a.trace_id))
-            .unwrap_or(0.0)
+        let Some(a) = self.annotations.get(idx) else { return 0.0; };
+        if let crate::align::AlignmentMode::PiecewiseWarp = self.alignment.mode {
+            let li = self.alignment.annotation_local_idx.get(idx).copied().unwrap_or(0);
+            if let Some(dt) = self.alignment.display_annotation_times
+                .get(a.trace_id).and_then(|v| v.get(li)) {
+                return dt.display_end;
+            }
+        }
+        a.end_ts() + self.trace_offset(a.trace_id)
     }
 
     /// Human-readable alignment status for the header, or None for a single
@@ -2044,6 +2067,62 @@ mod tests {
     #[test]
     fn test_app_has_offset_only_alignment_by_default() {
         let app = sample_app();
+        assert!(matches!(app.alignment.mode, crate::align::AlignmentMode::OffsetOnly));
+    }
+
+    // T9: in PiecewiseWarp mode kernel_render_ts reads display times, not raw+offset.
+    #[test]
+    fn test_render_ts_uses_warped_time_in_piecewise() {
+        let t0 = trace_of(
+            (0..3).flat_map(|b: usize| {
+                let b0 = b as f64 * 1000.0;
+                vec![kd(1, b0, "gemm", 8.0), kd(1, b0 + 10.0, "relu", 4.0)]
+            }).collect(),
+            vec![],
+        );
+        let t1 = trace_of(
+            (0..3).flat_map(|b: usize| {
+                let b1 = b as f64 * 900.0;
+                vec![kd(1, b1, "gemm", 8.0), kd(1, b1 + 10.0, "relu", 4.0)]
+            }).collect(),
+            vec![],
+        );
+        let app = App::new_multi(vec![("T0".into(), t0), ("T1".into(), t1)]);
+        assert!(matches!(app.alignment.mode, crate::align::AlignmentMode::PiecewiseWarp),
+            "3 matched blocks → PiecewiseWarp");
+        let t1_gemm = app.kernels.iter().position(|k| k.trace_id == 1 && k.name == "gemm").unwrap();
+        let display = app.kernel_render_ts(t1_gemm);
+        assert!(display != app.kernels[t1_gemm].ts || app.traces[1].offset_us == 0.0,
+            "PiecewiseWarp: display ts {display} must reflect warped position");
+    }
+
+    // T10: new_multi with 3 gap-separated blocks per trace triggers PiecewiseWarp.
+    #[test]
+    fn test_new_multi_builds_piecewise_when_blocks_present() {
+        let t0 = trace_of(
+            (0..3).flat_map(|b: usize| {
+                let b0 = b as f64 * 1000.0;
+                vec![kd(1, b0, "gemm", 8.0), kd(1, b0 + 10.0, "relu", 4.0)]
+            }).collect(),
+            vec![],
+        );
+        let t1 = trace_of(
+            (0..3).flat_map(|b: usize| {
+                let b1 = b as f64 * 900.0;
+                vec![kd(1, b1, "gemm", 8.0), kd(1, b1 + 10.0, "relu", 4.0)]
+            }).collect(),
+            vec![],
+        );
+        let app = App::new_multi(vec![("T0".into(), t0), ("T1".into(), t1)]);
+        assert!(matches!(app.alignment.mode, crate::align::AlignmentMode::PiecewiseWarp));
+        assert!(!app.alignment.display_kernel_times.iter().all(|v| v.is_empty()),
+            "display times must be populated");
+    }
+
+    // T10: single-trace new_multi keeps OffsetOnly (S4).
+    #[test]
+    fn test_new_multi_single_trace_offset_only() {
+        let app = app_with_annotations();
         assert!(matches!(app.alignment.mode, crate::align::AlignmentMode::OffsetOnly));
     }
 }
