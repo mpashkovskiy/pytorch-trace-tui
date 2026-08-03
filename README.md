@@ -14,14 +14,21 @@ in seconds.
 
 ## Install
 
+Select the version from GitHub releases, replace v0.2.0 below with any version you need and run:
+
 ```bash
-cargo install --path .
+wget https://github.com/mpashkovskiy/pytorch-trace-tui/releases/download/v0.2.0/pytorch-trace-tui-x86_64-unknown-linux-gnu
+chmod +x pytorch-trace-tui-x86_64-unknown-linux-gnu
+# make sure you run from folder with traces
+./pytorch-trace-tui-x86_64-unknown-linux-gnu
 ```
 
-or build locally:
+Or build and install from traces
 
 ```bash
+git clone https://github.com/mpashkovskiy/pytorch-trace-tui.git
 cargo build --release
+cargo install --path .
 ```
 
 ## Usage
