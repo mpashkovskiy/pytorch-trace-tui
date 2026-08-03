@@ -2155,4 +2155,42 @@ mod tests {
         assert!(matches!(app.alignment.mode, crate::align::AlignmentMode::OffsetOnly),
             "G-key must switch to OffsetOnly");
     }
+
+    // S1 integration: piecewise-aligned matched blocks have equal display_start,
+    // so they render at the same horizontal position on the shared time axis.
+    #[test]
+    fn test_s1_piecewise_matched_blocks_have_equal_display_start() {
+        let t0 = trace_of(
+            (0..3).flat_map(|b: usize| {
+                let b0 = b as f64 * 1000.0;
+                vec![kd(1, b0, "gemm", 8.0), kd(1, b0 + 10.0, "relu", 4.0)]
+            }).collect(),
+            vec![],
+        );
+        let t1 = trace_of(
+            (0..3).flat_map(|b: usize| {
+                let b1 = b as f64 * 900.0;
+                vec![kd(1, b1, "gemm", 8.0), kd(1, b1 + 10.0, "relu", 4.0)]
+            }).collect(),
+            vec![],
+        );
+        let app = App::new_multi(vec![("T0".into(), t0), ("T1".into(), t1)]);
+        assert!(matches!(app.alignment.mode, crate::align::AlignmentMode::PiecewiseWarp));
+
+        let mut aligned_pairs = 0;
+        for block in &app.alignment.blocks {
+            let (Some(tb0), Some(tb1)) = (&block.per_trace[0], &block.per_trace[1]) else {
+                continue;
+            };
+            let d0 = app.kernel_render_ts(tb0.kernel_indices.start);
+            let d1 = app.kernel_render_ts(tb1.kernel_indices.start);
+            assert!(
+                (d0 - d1).abs() < 1e-3,
+                "S1: block {} T0 display={} T1 display={} differ",
+                block.id, d0, d1
+            );
+            aligned_pairs += 1;
+        }
+        assert!(aligned_pairs >= 2, "need ≥2 matched pairs, got {}", aligned_pairs);
+    }
 }
