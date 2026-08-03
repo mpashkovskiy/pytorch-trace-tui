@@ -69,6 +69,7 @@ pub struct Sequence {
     pub reps_found: usize,
     pub source_lane: usize,
     pub source_start: usize,
+    pub scroll: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -108,12 +109,19 @@ impl App {
 
         let lanes = build_lanes(&kernels, &annotations, &streams);
 
+        // Start on the first kernel lane so the current selection is a kernel
+        // (N / sequence work immediately); fall back to lane 0 if none exist.
+        let initial_lane = lanes
+            .iter()
+            .position(|l| !l.is_annotations())
+            .unwrap_or(0);
+
         let mut app = App {
             kernels,
             annotations,
             streams,
             lanes,
-            active_lane: 0,
+            active_lane: initial_lane,
             selected_item: 0,
             zoom_level: 1.0,
             lane_view_offset: 0,
@@ -354,8 +362,10 @@ impl App {
             reps_found: 1,
             source_lane: lane_idx,
             source_start: start,
+            scroll: 0,
         });
         self.sequence_status = None;
+        self.extend_sequence_median();
         true
     }
 
@@ -364,18 +374,38 @@ impl App {
         self.sequence_status = None;
     }
 
+    pub fn sequence_scroll_up(&mut self, amount: usize) {
+        if let Some(seq) = self.sequence.as_mut() {
+            seq.scroll = seq.scroll.saturating_sub(amount);
+        }
+    }
+
+    pub fn sequence_scroll_down(&mut self, amount: usize, viewport: usize) {
+        if let Some(seq) = self.sequence.as_mut() {
+            let max = seq.rows.len().saturating_sub(viewport);
+            seq.scroll = (seq.scroll + amount).min(max);
+        }
+    }
+
     pub fn sequence_csv(&self) -> Option<String> {
         let seq = self.sequence.as_ref()?;
-        let mut out = String::from("idx,kernel name,duration\n");
-        for (idx, name, dur) in &seq.rows {
-            out.push_str(&format!("{},{},{}\n", idx, name, format_dur(*dur)));
+        let mut out = String::from("idx\tkernel name\tmedian\n");
+        for (i, (idx, name, _dur)) in seq.rows.iter().enumerate() {
+            let med = seq
+                .median
+                .as_ref()
+                .and_then(|m| m.get(i))
+                .map(|(_, v)| *v)
+                .unwrap_or(0.0);
+            out.push_str(&format!("{}\t{}\t{:.2}\n", idx, name, med));
         }
         Some(out)
     }
 
-    /// Scan forward for contiguous blocks whose ordered kernel names exactly
-    /// match the captured sequence, then compute the per-position median
-    /// duration across every matching block (including the original).
+    /// Scan forward for every block whose ordered kernel names exactly match the
+    /// captured sequence — occurrences may be non-contiguous (intervening
+    /// non-matching kernels are skipped) — then compute the per-position median
+    /// duration across every matching block, including the original.
     pub fn extend_sequence_median(&mut self) {
         let Some(seq) = self.sequence.as_ref() else {
             return;
@@ -404,16 +434,19 @@ impl App {
                     .map(|k| k.name == pattern[off])
                     .unwrap_or(false)
             });
-            if !matches {
-                break;
-            }
-            for (off, slot) in per_pos.iter_mut().enumerate() {
-                if let Some(k) = item_indices.get(start + off).and_then(|&i| self.kernels.get(i)) {
-                    slot.push(k.dur);
+            if matches {
+                for (off, slot) in per_pos.iter_mut().enumerate() {
+                    if let Some(k) =
+                        item_indices.get(start + off).and_then(|&i| self.kernels.get(i))
+                    {
+                        slot.push(k.dur);
+                    }
                 }
+                reps += 1;
+                start += block_len;
+            } else {
+                start += 1;
             }
-            reps += 1;
-            start += block_len;
         }
 
         let median: Vec<(String, f64)> = pattern
@@ -562,10 +595,6 @@ pub fn kernel_columns(
         return None;
     }
     Some((start_col, end_col))
-}
-
-fn format_dur(dur: f64) -> String {
-    format!("{}", dur)
 }
 
 /// Median of the durations. Even counts average the two middle values; only
@@ -830,7 +859,9 @@ mod tests {
     #[test]
     fn test_tab_selects_annotation_lane_and_ad_navigates() {
         let mut app = app_with_annotations();
-        // Active lane starts on the annotation lane (rendered first).
+        // Startup is the kernel lane; Tab wraps to the annotation lane.
+        assert!(!app.active_lane_is_annotations());
+        app.next_lane();
         assert!(app.active_lane_is_annotations());
         match app.selected_trace_item().unwrap() {
             SelectedTraceItem::Annotation(a) => assert_eq!(a.name, "ctx_0"),
@@ -859,6 +890,8 @@ mod tests {
     fn test_lane_change_selects_nearest_ts() {
         // Annotation ctx_1 at ts=180; nearest kernel is kernel_b at ts=200.
         let mut app = app_with_annotations();
+        app.next_lane(); // to annotation lane
+        assert!(app.active_lane_is_annotations());
         app.next_item(); // annotation ctx_1 (ts 180)
         app.next_lane(); // kernel lane; should land near ts 180 → kernel_b (200)
         match app.selected_trace_item().unwrap() {
@@ -1114,7 +1147,7 @@ mod tests {
         );
         assert_eq!(
             app.sequence_csv().unwrap(),
-            "idx,kernel name,duration\n1,foo,10\n2,bar,20\n3,baz,5\n"
+            "idx\tkernel name\tmedian\n1\tfoo\t10.00\n2\tbar\t20.00\n3\tbaz\t5.00\n"
         );
     }
 
@@ -1143,9 +1176,38 @@ mod tests {
     #[test]
     fn test_sequence_none_on_annotation_lane() {
         let mut app = app_with_annotations();
+        app.next_lane();
         assert!(app.active_lane_is_annotations());
         assert!(!app.start_sequence());
         assert!(app.sequence.is_none());
+    }
+
+    // Bug #2: N works from a kernel lane WITHOUT any prior search. The current
+    // selected kernel drives the sequence even right after startup.
+    #[test]
+    fn test_sequence_works_without_prior_search() {
+        let mut app = app_with_annotations();
+        assert!(!app.active_lane_is_annotations());
+        assert!(app.start_sequence());
+        let seq = app.sequence.as_ref().unwrap();
+        assert_eq!(seq.rows.first().map(|(_, n, _)| n.as_str()), Some("kernel_a"));
+    }
+
+    // Bug #2 root cause: on startup the initial active lane must be a kernel lane
+    // (not annotations), so N works immediately without navigating or searching.
+    #[test]
+    fn test_initial_active_lane_is_kernel_when_available() {
+        let app = app_with_annotations();
+        assert!(!app.active_lane_is_annotations());
+        assert!(app.selected_trace_item().is_some());
+    }
+
+    #[test]
+    fn test_sequence_works_on_startup_without_navigation() {
+        let mut app = app_with_annotations();
+        assert!(app.start_sequence());
+        let seq = app.sequence.as_ref().unwrap();
+        assert_eq!(seq.rows.first().map(|(_, n, _)| n.as_str()), Some("kernel_a"));
     }
 
     // S3: per-position median over exact repeated blocks.
@@ -1202,16 +1264,16 @@ mod tests {
         assert!((median[1].1 - 250.0).abs() < 1e-9, "even median bar got {}", median[1].1);
     }
 
-    // Median scan stops at the first block that doesn't match the pattern exactly.
+    // Median scan finds repeats ANYWHERE later, skipping intervening kernels.
     #[test]
-    fn test_sequence_median_stops_at_mismatch() {
+    fn test_sequence_median_finds_non_contiguous_repeats() {
         let kernels = vec![
             kd(1, 0.0, "foo", 10.0),
             kd(1, 10.0, "bar", 20.0),
             kd(1, 20.0, "foo", 12.0),
             kd(1, 30.0, "bar", 24.0),
             kd(1, 40.0, "foo", 11.0),
-            kd(1, 50.0, "qux", 99.0), // breaks the [foo,bar] pattern
+            kd(1, 50.0, "qux", 99.0), // gap between blocks — must be skipped, not a stop
             kd(1, 60.0, "foo", 8.0),
             kd(1, 70.0, "bar", 8.0),
         ];
@@ -1219,7 +1281,12 @@ mod tests {
         assert!(app.start_sequence());
         app.extend_sequence_median();
         let seq = app.sequence.as_ref().unwrap();
-        assert_eq!(seq.reps_found, 2, "only first two [foo,bar] blocks are contiguous matches");
+        assert_eq!(seq.reps_found, 3, "3 [foo,bar] blocks: at 0, 20, 60 (qux skipped)");
+        let median = seq.median.as_ref().unwrap();
+        // foo durs (10,12,8) sorted (8,10,12) → 10
+        assert!((median[0].1 - 10.0).abs() < 1e-9, "foo median got {}", median[0].1);
+        // bar durs (20,24,8) sorted (8,20,24) → 20
+        assert!((median[1].1 - 20.0).abs() < 1e-9, "bar median got {}", median[1].1);
     }
 
     // S4 regression: no sequence by default; close clears it.
@@ -1231,6 +1298,30 @@ mod tests {
         assert!(app.sequence.is_some());
         app.close_sequence();
         assert!(app.sequence.is_none());
+    }
+
+    #[test]
+    fn test_sequence_scroll_clamps_to_bounds() {
+        let kernels: Vec<KernelEvent> = (0..10)
+            .map(|i| kd(1, i as f64 * 10.0, &format!("k{}", i), i as f64))
+            .collect();
+        let mut app = app_from(kernels);
+        assert!(app.start_sequence());
+        assert_eq!(app.sequence.as_ref().unwrap().rows.len(), 10);
+        assert_eq!(app.sequence.as_ref().unwrap().scroll, 0);
+
+        // Scroll up at the top is a no-op.
+        app.sequence_scroll_up(3);
+        assert_eq!(app.sequence.as_ref().unwrap().scroll, 0);
+
+        // With a viewport of 4, max scroll is 10 - 4 = 6.
+        app.sequence_scroll_down(3, 4);
+        assert_eq!(app.sequence.as_ref().unwrap().scroll, 3);
+        app.sequence_scroll_down(100, 4);
+        assert_eq!(app.sequence.as_ref().unwrap().scroll, 6);
+
+        app.sequence_scroll_up(2);
+        assert_eq!(app.sequence.as_ref().unwrap().scroll, 4);
     }
 
     #[test]

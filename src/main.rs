@@ -215,8 +215,18 @@ fn event_loop(
                             KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => {
                                 app.close_sequence();
                             }
-                            KeyCode::Char('m') | KeyCode::Char('M') => {
-                                app.extend_sequence_median();
+                            KeyCode::Up => {
+                                app.sequence_scroll_up(1);
+                            }
+                            KeyCode::Down => {
+                                app.sequence_scroll_down(1, sequence_viewport(term_height, app));
+                            }
+                            KeyCode::PageUp => {
+                                app.sequence_scroll_up(sequence_viewport(term_height, app));
+                            }
+                            KeyCode::PageDown => {
+                                let vp = sequence_viewport(term_height, app);
+                                app.sequence_scroll_down(vp, vp);
                             }
                             KeyCode::Char('y') | KeyCode::Char('Y') => {
                                 if let Some(csv) = app.sequence_csv() {
@@ -294,4 +304,15 @@ fn event_loop(
     }
 
     Ok(())
+}
+
+/// Number of scrollable kernel rows the sequence popup shows. Mirrors the UI's
+/// geometry: popup is 70% of terminal height, inner drops 2 border rows, then
+/// the header row and the footer block (blank + optional status + reps-line +
+/// hint) are reserved.
+fn sequence_viewport(term_height: usize, app: &App) -> usize {
+    let popup_h = term_height * 70 / 100;
+    let inner = popup_h.saturating_sub(2);
+    let footer_reserved = 3 + usize::from(app.sequence_status.is_some());
+    inner.saturating_sub(1 + footer_reserved).max(1)
 }

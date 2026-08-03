@@ -3,7 +3,7 @@ use flate2::read::GzDecoder;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::{BufRead, BufReader};
+use std::io::{self, BufRead, BufReader, Read};
 
 const GPU_CATS: &[&str] = &["kernel", "gpu_memcpy", "gpu_memset"];
 const ANNOTATION_CAT: &str = "gpu_user_annotation";
@@ -69,16 +69,20 @@ pub struct Trace {
 
 pub fn parse_trace(path: &str) -> Result<Trace> {
     let file = File::open(path).with_context(|| format!("Cannot open trace file: {}", path))?;
+    let total = file.metadata().map(|m| m.len()).unwrap_or(0);
+    let progress = ProgressReader::new(file, total);
 
     let mut trace = if path.ends_with(".gz") {
-        let gz = GzDecoder::new(file);
+        let gz = GzDecoder::new(progress);
         let reader = BufReader::with_capacity(1 << 16, gz);
         parse_lexer(reader)
     } else {
-        let reader = BufReader::with_capacity(1 << 16, file);
+        let reader = BufReader::with_capacity(1 << 16, progress);
         parse_lexer(reader)
     }
     .context("Failed to parse trace")?;
+
+    progress_finish(total);
 
     trace
         .kernels
@@ -87,6 +91,60 @@ pub fn parse_trace(path: &str) -> Result<Trace> {
         .annotations
         .sort_by(|a, b| a.ts.partial_cmp(&b.ts).unwrap_or(std::cmp::Ordering::Equal));
     Ok(trace)
+}
+
+/// Wraps the trace file and renders a byte-progress bar to stderr as bytes are
+/// read. For `.gz` traces this tracks compressed bytes (the actual I/O), which
+/// still advances monotonically to 100%.
+struct ProgressReader<R: Read> {
+    inner: R,
+    read: u64,
+    total: u64,
+    last_render_pct: u64,
+}
+
+impl<R: Read> ProgressReader<R> {
+    fn new(inner: R, total: u64) -> Self {
+        Self {
+            inner,
+            read: 0,
+            total,
+            last_render_pct: u64::MAX,
+        }
+    }
+
+    fn render(&mut self) {
+        if self.total == 0 {
+            return;
+        }
+        let pct = (self.read.saturating_mul(100) / self.total).min(100);
+        if pct == self.last_render_pct {
+            return;
+        }
+        self.last_render_pct = pct;
+        let filled = (pct as usize * PROGRESS_WIDTH) / 100;
+        let bar: String = "█".repeat(filled) + &"░".repeat(PROGRESS_WIDTH - filled);
+        eprint!("\rParsing trace [{}] {:>3}%", bar, pct);
+        let _ = io::Write::flush(&mut io::stderr());
+    }
+}
+
+const PROGRESS_WIDTH: usize = 40;
+
+fn progress_finish(total: u64) {
+    if total > 0 {
+        let bar = "█".repeat(PROGRESS_WIDTH);
+        eprintln!("\rParsing trace [{}] 100%", bar);
+    }
+}
+
+impl<R: Read> Read for ProgressReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        self.read += n as u64;
+        self.render();
+        Ok(n)
+    }
 }
 
 fn parse_lexer<R: BufRead>(mut reader: R) -> Result<Trace> {

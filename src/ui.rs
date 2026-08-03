@@ -3,7 +3,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Style, Stylize},
     text::{Line, Span},
-    widgets::{Block, BorderType, Borders, Clear, Paragraph},
+    widgets::{Block, BorderType, Borders, Clear, Paragraph, Wrap},
     Frame,
 };
 
@@ -77,27 +77,57 @@ fn render_sequence_popup(frame: &mut Frame, area: Rect, app: &App) {
     let inner = block.inner(popup);
     frame.render_widget(block, popup);
 
-    let has_median = seq.median.is_some();
     let mut lines: Vec<Line> = Vec::new();
 
-    let header = if has_median {
-        format!("{:>4}  {:<32}{:>12}{:>14}", "idx", "kernel name", "dur", "median")
-    } else {
-        format!("{:>4}  {:<32}{:>12}", "idx", "kernel name", "dur")
-    };
+    // Columns: idx (fixed), median (fixed, right-aligned), name (fills the rest).
+    let idx_w = 5usize;
+    let med_w = 12usize;
+    let name_w = (inner.width as usize)
+        .saturating_sub(idx_w + 2 + med_w)
+        .max(8);
+
+    let header = format!(
+        "{:>idx$}  {:<name$}{:>med$}",
+        "idx",
+        "kernel name",
+        "median",
+        idx = idx_w,
+        name = name_w,
+        med = med_w,
+    );
     lines.push(Line::from(Span::styled(
         header,
         Style::new().fg(Color::Cyan).bold(),
     )));
 
-    for (i, (idx, name, dur)) in seq.rows.iter().enumerate() {
-        let name_disp = ellipsize(name, 32);
-        let row = if let Some(median) = seq.median.as_ref() {
-            let med = median.get(i).map(|(_, m)| *m).unwrap_or(0.0);
-            format!("{:>4}  {:<32}{:>12}{:>14}", idx, name_disp, dur, med)
-        } else {
-            format!("{:>4}  {:<32}{:>12}", idx, name_disp, dur)
-        };
+    // Reserve rows for the header plus the footer block (blank + status +
+    // reps-line + hint); the remainder is the scrollable viewport for rows.
+    let footer_reserved = 3 + usize::from(app.sequence_status.is_some());
+    let viewport = (inner.height as usize)
+        .saturating_sub(1 + footer_reserved)
+        .max(1);
+    let total = seq.rows.len();
+    let scroll = seq.scroll.min(total.saturating_sub(viewport));
+    let end = (scroll + viewport).min(total);
+
+    for (i, (idx, name, _dur)) in seq.rows[scroll..end].iter().enumerate() {
+        let row_idx = scroll + i;
+        let med = seq
+            .median
+            .as_ref()
+            .and_then(|m| m.get(row_idx))
+            .map(|(_, v)| *v)
+            .unwrap_or(0.0);
+        let name_disp = ellipsize(name, name_w);
+        let row = format!(
+            "{:>idx$}  {:<name$}{:>med$}",
+            idx,
+            name_disp,
+            format!("{:.2}", med),
+            idx = idx_w,
+            name = name_w,
+            med = med_w,
+        );
         lines.push(Line::from(Span::styled(row, Style::new().fg(Color::White))));
     }
 
@@ -108,14 +138,17 @@ fn render_sequence_popup(frame: &mut Frame, area: Rect, app: &App) {
             Style::new().fg(Color::Green),
         )));
     }
-    if has_median {
-        lines.push(Line::from(Span::styled(
-            format!("median across {} block(s)", seq.reps_found),
-            Style::new().fg(Color::DarkGray),
-        )));
-    }
     lines.push(Line::from(Span::styled(
-        "[y] copy   [m] median   [Esc/n] close",
+        format!("median across {} block(s)", seq.reps_found),
+        Style::new().fg(Color::DarkGray),
+    )));
+    let scroll_hint = if total > viewport {
+        format!("  [{}-{}/{} ↑↓ PgUp/PgDn]", scroll + 1, end, total)
+    } else {
+        String::new()
+    };
+    lines.push(Line::from(Span::styled(
+        format!("[y] copy   [Esc/n] close{}", scroll_hint),
         Style::new().fg(Color::DarkGray),
     )));
 
@@ -379,20 +412,7 @@ fn render_info_panel(frame: &mut Frame, area: Rect, app: &App) {
         SelectedTraceItem::Kernel(k) => {
             let na = || "N/A".to_string();
             let lines: Vec<Line> = vec![
-                Line::from(vec![
-                    kv_label("Name: "),
-                    kv_value(&k.name),
-                    Span::raw("  "),
-                    kv_label("Cat: "),
-                    kv_value(&k.cat),
-                ]),
-                Line::from(vec![
-                    kv_label("Stream: "),
-                    kv_value(&format!("cuda:{}", k.stream)),
-                    Span::raw("  "),
-                    kv_label("Device: "),
-                    kv_value(&format!("{}", k.device)),
-                ]),
+                Line::from(vec![kv_label("Name: "), kv_value(&k.name)]),
                 Line::from(vec![
                     kv_label("Start: "),
                     kv_value(&format!("{:.3} μs", k.ts)),
@@ -422,7 +442,7 @@ fn render_info_panel(frame: &mut Frame, area: Rect, app: &App) {
                     kv_value(&k.correlation.map_or_else(na, |v| v.to_string())),
                 ]),
             ];
-            frame.render_widget(Paragraph::new(lines), inner);
+            frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
         }
     }
 }
