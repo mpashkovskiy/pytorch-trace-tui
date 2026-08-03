@@ -3,7 +3,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Style, Stylize},
     text::{Line, Span},
-    widgets::{Block, BorderType, Borders, Paragraph},
+    widgets::{Block, BorderType, Borders, Clear, Paragraph},
     Frame,
 };
 
@@ -36,6 +36,90 @@ pub fn render(frame: &mut Frame, app: &App) {
     render_header(frame, chunks[0], app);
     render_lane(frame, chunks[1], app);
     render_info_panel(frame, chunks[2], app);
+
+    if app.sequence.is_some() {
+        render_sequence_popup(frame, area, app);
+    }
+}
+
+fn centered_rect(area: Rect, pct_x: u16, pct_y: u16) -> Rect {
+    let v = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage((100 - pct_y) / 2),
+            Constraint::Percentage(pct_y),
+            Constraint::Percentage((100 - pct_y) / 2),
+        ])
+        .split(area);
+    Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage((100 - pct_x) / 2),
+            Constraint::Percentage(pct_x),
+            Constraint::Percentage((100 - pct_x) / 2),
+        ])
+        .split(v[1])[1]
+}
+
+fn render_sequence_popup(frame: &mut Frame, area: Rect, app: &App) {
+    let Some(seq) = app.sequence.as_ref() else {
+        return;
+    };
+    let popup = centered_rect(area, 70, 70);
+    frame.render_widget(Clear, popup);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::new().fg(Color::Magenta))
+        .title(" Kernel Sequence ")
+        .title_style(Style::new().fg(Color::Magenta).bold());
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+
+    let has_median = seq.median.is_some();
+    let mut lines: Vec<Line> = Vec::new();
+
+    let header = if has_median {
+        format!("{:>4}  {:<32}{:>12}{:>14}", "idx", "kernel name", "dur", "median")
+    } else {
+        format!("{:>4}  {:<32}{:>12}", "idx", "kernel name", "dur")
+    };
+    lines.push(Line::from(Span::styled(
+        header,
+        Style::new().fg(Color::Cyan).bold(),
+    )));
+
+    for (i, (idx, name, dur)) in seq.rows.iter().enumerate() {
+        let name_disp = ellipsize(name, 32);
+        let row = if let Some(median) = seq.median.as_ref() {
+            let med = median.get(i).map(|(_, m)| *m).unwrap_or(0.0);
+            format!("{:>4}  {:<32}{:>12}{:>14}", idx, name_disp, dur, med)
+        } else {
+            format!("{:>4}  {:<32}{:>12}", idx, name_disp, dur)
+        };
+        lines.push(Line::from(Span::styled(row, Style::new().fg(Color::White))));
+    }
+
+    lines.push(Line::from(""));
+    if let Some(status) = app.sequence_status.as_ref() {
+        lines.push(Line::from(Span::styled(
+            status.clone(),
+            Style::new().fg(Color::Green),
+        )));
+    }
+    if has_median {
+        lines.push(Line::from(Span::styled(
+            format!("median across {} block(s)", seq.reps_found),
+            Style::new().fg(Color::DarkGray),
+        )));
+    }
+    lines.push(Line::from(Span::styled(
+        "[y] copy   [m] median   [Esc/n] close",
+        Style::new().fg(Color::DarkGray),
+    )));
+
+    frame.render_widget(Paragraph::new(lines), inner);
 }
 
 fn render_header(frame: &mut Frame, area: Rect, app: &App) {

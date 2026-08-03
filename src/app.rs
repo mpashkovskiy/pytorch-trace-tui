@@ -60,6 +60,17 @@ impl SelectedTraceItem<'_> {
     }
 }
 
+/// Kernels from the current one up to (exclusive) the next same-named kernel in
+/// the lane. `median` holds per-position median duration across repeated blocks.
+#[derive(Debug, Clone)]
+pub struct Sequence {
+    pub rows: Vec<(usize, String, f64)>,
+    pub median: Option<Vec<(String, f64)>>,
+    pub reps_found: usize,
+    pub source_lane: usize,
+    pub source_start: usize,
+}
+
 #[derive(Debug, Clone)]
 pub struct App {
     pub kernels: Vec<KernelEvent>,
@@ -73,6 +84,8 @@ pub struct App {
     pub search_active: bool,
     pub search_query: String,
     pub search_no_match: bool,
+    pub sequence: Option<Sequence>,
+    pub sequence_status: Option<String>,
 }
 
 impl App {
@@ -107,6 +120,8 @@ impl App {
             search_active: false,
             search_query: String::new(),
             search_no_match: false,
+            sequence: None,
+            sequence_status: None,
         };
         app.clamp_selected_item();
         app
@@ -289,6 +304,130 @@ impl App {
         self.search_no_match = true;
     }
 
+    // ── Sequence between same-named kernels (N key) ──────────────────────────
+
+    fn active_kernel_lane(&self) -> Option<(usize, &[usize])> {
+        let lane = self.lanes.get(self.active_lane)?;
+        match lane {
+            Lane::Kernels { item_indices, .. } => Some((self.active_lane, item_indices)),
+            Lane::Annotations { .. } => None,
+        }
+    }
+
+    pub fn start_sequence(&mut self) -> bool {
+        let Some((lane_idx, item_indices)) = self.active_kernel_lane() else {
+            return false;
+        };
+        let start = self.selected_item;
+        let Some(&start_kernel_idx) = item_indices.get(start) else {
+            return false;
+        };
+        let Some(start_kernel) = self.kernels.get(start_kernel_idx) else {
+            return false;
+        };
+        let name = start_kernel.name.clone();
+
+        // End at the next kernel with the same name (exclusive), or the lane end.
+        let mut end = item_indices.len();
+        for pos in (start + 1)..item_indices.len() {
+            if let Some(k) = item_indices.get(pos).and_then(|&i| self.kernels.get(i)) {
+                if k.name == name {
+                    end = pos;
+                    break;
+                }
+            }
+        }
+
+        let rows: Vec<(usize, String, f64)> = item_indices[start..end]
+            .iter()
+            .enumerate()
+            .filter_map(|(offset, &kidx)| {
+                self.kernels
+                    .get(kidx)
+                    .map(|k| (offset + 1, k.name.clone(), k.dur))
+            })
+            .collect();
+
+        self.sequence = Some(Sequence {
+            rows,
+            median: None,
+            reps_found: 1,
+            source_lane: lane_idx,
+            source_start: start,
+        });
+        self.sequence_status = None;
+        true
+    }
+
+    pub fn close_sequence(&mut self) {
+        self.sequence = None;
+        self.sequence_status = None;
+    }
+
+    pub fn sequence_csv(&self) -> Option<String> {
+        let seq = self.sequence.as_ref()?;
+        let mut out = String::from("idx,kernel name,duration\n");
+        for (idx, name, dur) in &seq.rows {
+            out.push_str(&format!("{},{},{}\n", idx, name, format_dur(*dur)));
+        }
+        Some(out)
+    }
+
+    /// Scan forward for contiguous blocks whose ordered kernel names exactly
+    /// match the captured sequence, then compute the per-position median
+    /// duration across every matching block (including the original).
+    pub fn extend_sequence_median(&mut self) {
+        let Some(seq) = self.sequence.as_ref() else {
+            return;
+        };
+        let block_len = seq.rows.len();
+        if block_len == 0 {
+            return;
+        }
+        let pattern: Vec<String> = seq.rows.iter().map(|(_, n, _)| n.clone()).collect();
+        let source_lane = seq.source_lane;
+        let source_start = seq.source_start;
+
+        let Some(Lane::Kernels { item_indices, .. }) = self.lanes.get(source_lane) else {
+            return;
+        };
+        let item_indices = item_indices.clone();
+
+        let mut per_pos: Vec<Vec<f64>> = vec![Vec::new(); block_len];
+        let mut reps = 0usize;
+        let mut start = source_start;
+        while start + block_len <= item_indices.len() {
+            let matches = (0..block_len).all(|off| {
+                item_indices
+                    .get(start + off)
+                    .and_then(|&i| self.kernels.get(i))
+                    .map(|k| k.name == pattern[off])
+                    .unwrap_or(false)
+            });
+            if !matches {
+                break;
+            }
+            for (off, slot) in per_pos.iter_mut().enumerate() {
+                if let Some(k) = item_indices.get(start + off).and_then(|&i| self.kernels.get(i)) {
+                    slot.push(k.dur);
+                }
+            }
+            reps += 1;
+            start += block_len;
+        }
+
+        let median: Vec<(String, f64)> = pattern
+            .iter()
+            .zip(per_pos.iter())
+            .map(|(name, durs)| (name.clone(), median_of(durs)))
+            .collect();
+
+        if let Some(seq) = self.sequence.as_mut() {
+            seq.median = Some(median);
+            seq.reps_found = reps;
+        }
+    }
+
     // ── Vertical scroll — one lane == one rendered row ───────────────────────
 
     pub fn ensure_active_lane_visible(&mut self, visible_rows: usize) {
@@ -423,6 +562,26 @@ pub fn kernel_columns(
         return None;
     }
     Some((start_col, end_col))
+}
+
+fn format_dur(dur: f64) -> String {
+    format!("{}", dur)
+}
+
+/// Median of the durations. Even counts average the two middle values; only
+/// finite values are considered, and comparison uses `total_cmp` for ordering.
+fn median_of(durs: &[f64]) -> f64 {
+    let mut finite: Vec<f64> = durs.iter().copied().filter(|d| d.is_finite()).collect();
+    if finite.is_empty() {
+        return 0.0;
+    }
+    finite.sort_by(|a, b| a.total_cmp(b));
+    let n = finite.len();
+    if !n.is_multiple_of(2) {
+        finite[n / 2]
+    } else {
+        (finite[n / 2 - 1] + finite[n / 2]) / 2.0
+    }
 }
 
 #[cfg(test)]
@@ -911,5 +1070,201 @@ mod tests {
         let (s, e) = kernel_columns(950.0, 1050.0, 1000.0, 1100.0, 100).unwrap();
         assert_eq!(s, 0);
         assert_eq!(e, 50);
+    }
+
+    // ── Sequence feature (N key) ─────────────────────────────────────────────
+
+    fn kd(stream: u64, ts: f64, name: &str, dur: f64) -> KernelEvent {
+        KernelEvent {
+            name: name.to_string(),
+            cat: "kernel".to_string(),
+            ts,
+            dur,
+            device: 0,
+            stream,
+            grid: None,
+            block: None,
+            shared_memory: None,
+            registers_per_thread: None,
+            correlation: None,
+        }
+    }
+
+    // S1: sequence runs from current up to (not including) next same-named kernel.
+    #[test]
+    fn test_sequence_between_same_named() {
+        let kernels = vec![
+            kd(1, 0.0, "foo", 10.0),
+            kd(1, 20.0, "bar", 20.0),
+            kd(1, 50.0, "baz", 5.0),
+            kd(1, 60.0, "foo", 8.0),
+            kd(1, 80.0, "qux", 3.0),
+        ];
+        let mut app = app_from(kernels);
+        assert_eq!(app.selected_item, 0);
+        assert!(app.start_sequence());
+        let seq = app.sequence.as_ref().unwrap();
+        assert_eq!(
+            seq.rows,
+            vec![
+                (1, "foo".to_string(), 10.0),
+                (2, "bar".to_string(), 20.0),
+                (3, "baz".to_string(), 5.0),
+            ]
+        );
+        assert_eq!(
+            app.sequence_csv().unwrap(),
+            "idx,kernel name,duration\n1,foo,10\n2,bar,20\n3,baz,5\n"
+        );
+    }
+
+    // S2a: no next same-named → sequence to end of lane.
+    #[test]
+    fn test_sequence_to_end_of_lane() {
+        let kernels = vec![
+            kd(1, 0.0, "a", 1.0),
+            kd(1, 10.0, "b", 2.0),
+            kd(1, 20.0, "c", 3.0),
+        ];
+        let mut app = app_from(kernels);
+        assert!(app.start_sequence());
+        let seq = app.sequence.as_ref().unwrap();
+        assert_eq!(
+            seq.rows,
+            vec![
+                (1, "a".to_string(), 1.0),
+                (2, "b".to_string(), 2.0),
+                (3, "c".to_string(), 3.0),
+            ]
+        );
+    }
+
+    // S2b: N on an annotation lane is a no-op (no sequence).
+    #[test]
+    fn test_sequence_none_on_annotation_lane() {
+        let mut app = app_with_annotations();
+        assert!(app.active_lane_is_annotations());
+        assert!(!app.start_sequence());
+        assert!(app.sequence.is_none());
+    }
+
+    // S3: per-position median over exact repeated blocks.
+    #[test]
+    fn test_sequence_median_per_position() {
+        let kernels = vec![
+            kd(1, 0.0, "foo", 10.0),
+            kd(1, 10.0, "bar", 20.0),
+            kd(1, 20.0, "foo", 12.0),
+            kd(1, 30.0, "bar", 24.0),
+            kd(1, 40.0, "foo", 11.0),
+            kd(1, 50.0, "bar", 22.0),
+            kd(1, 60.0, "foo", 9.0),
+        ];
+        let mut app = app_from(kernels);
+        assert!(app.start_sequence());
+        // Block = [foo, bar] (stops before next foo).
+        assert_eq!(app.sequence.as_ref().unwrap().rows.len(), 2);
+
+        app.extend_sequence_median();
+        let seq = app.sequence.as_ref().unwrap();
+        assert_eq!(seq.reps_found, 3, "3 exact [foo,bar] blocks");
+        let median = seq.median.as_ref().unwrap();
+        assert_eq!(median.len(), 2);
+        assert_eq!(median[0].0, "foo");
+        assert!((median[0].1 - 11.0).abs() < 1e-9, "median(10,12,11)=11 got {}", median[0].1);
+        assert_eq!(median[1].0, "bar");
+        assert!((median[1].1 - 22.0).abs() < 1e-9, "median(20,24,22)=22 got {}", median[1].1);
+    }
+
+    // Median of an even count = average of the two middle values.
+    #[test]
+    fn test_sequence_median_even_count() {
+        let kernels = vec![
+            kd(1, 0.0, "foo", 10.0),
+            kd(1, 10.0, "bar", 100.0),
+            kd(1, 20.0, "foo", 20.0),
+            kd(1, 30.0, "bar", 200.0),
+            kd(1, 40.0, "foo", 30.0),
+            kd(1, 50.0, "bar", 300.0),
+            kd(1, 60.0, "foo", 40.0),
+            kd(1, 70.0, "bar", 400.0),
+            kd(1, 80.0, "foo", 99.0),
+        ];
+        let mut app = app_from(kernels);
+        assert!(app.start_sequence());
+        app.extend_sequence_median();
+        let seq = app.sequence.as_ref().unwrap();
+        assert_eq!(seq.reps_found, 4);
+        let median = seq.median.as_ref().unwrap();
+        // foo durs (10,20,30,40) sorted → median = (20+30)/2 = 25
+        assert!((median[0].1 - 25.0).abs() < 1e-9, "even median foo got {}", median[0].1);
+        // bar durs (100,200,300,400) → (200+300)/2 = 250
+        assert!((median[1].1 - 250.0).abs() < 1e-9, "even median bar got {}", median[1].1);
+    }
+
+    // Median scan stops at the first block that doesn't match the pattern exactly.
+    #[test]
+    fn test_sequence_median_stops_at_mismatch() {
+        let kernels = vec![
+            kd(1, 0.0, "foo", 10.0),
+            kd(1, 10.0, "bar", 20.0),
+            kd(1, 20.0, "foo", 12.0),
+            kd(1, 30.0, "bar", 24.0),
+            kd(1, 40.0, "foo", 11.0),
+            kd(1, 50.0, "qux", 99.0), // breaks the [foo,bar] pattern
+            kd(1, 60.0, "foo", 8.0),
+            kd(1, 70.0, "bar", 8.0),
+        ];
+        let mut app = app_from(kernels);
+        assert!(app.start_sequence());
+        app.extend_sequence_median();
+        let seq = app.sequence.as_ref().unwrap();
+        assert_eq!(seq.reps_found, 2, "only first two [foo,bar] blocks are contiguous matches");
+    }
+
+    // S4 regression: no sequence by default; close clears it.
+    #[test]
+    fn test_sequence_default_none_and_close() {
+        let mut app = sample_app();
+        assert!(app.sequence.is_none());
+        assert!(app.start_sequence());
+        assert!(app.sequence.is_some());
+        app.close_sequence();
+        assert!(app.sequence.is_none());
+    }
+
+    #[test]
+    fn test_sequence_end_to_end_copy_writes_file_artifact() {
+        let kernels = vec![
+            kd(1, 0.0, "gemm", 10.0),
+            kd(1, 20.0, "relu", 20.0),
+            kd(1, 40.0, "gemm", 30.0),
+            kd(1, 60.0, "relu", 40.0),
+            kd(1, 80.0, "gemm", 50.0),
+        ];
+        let mut app = app_from(kernels);
+        assert!(app.start_sequence());
+        assert_eq!(
+            app.sequence.as_ref().unwrap().rows,
+            vec![(1, "gemm".to_string(), 10.0), (2, "relu".to_string(), 20.0)]
+        );
+
+        app.extend_sequence_median();
+        let seq = app.sequence.as_ref().unwrap();
+        assert_eq!(seq.reps_found, 2);
+        assert_eq!(
+            seq.median.as_ref().unwrap(),
+            &vec![("gemm".to_string(), 20.0), ("relu".to_string(), 30.0)]
+        );
+
+        let csv = app.sequence_csv().unwrap();
+        let mut sink: Vec<u8> = Vec::new();
+        let mut mgr = crate::clipboard::ClipboardManager::new();
+        let outcome = mgr.copy(&csv, &mut sink).unwrap();
+
+        assert!(outcome.via_osc52);
+        assert!(outcome.file_path.exists());
+        assert_eq!(std::fs::read_to_string(&outcome.file_path).unwrap(), csv);
+        let _ = std::fs::remove_file(&outcome.file_path);
     }
 }

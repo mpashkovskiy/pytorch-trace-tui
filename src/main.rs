@@ -1,4 +1,5 @@
 mod app;
+mod clipboard;
 mod trace;
 mod ui;
 
@@ -196,6 +197,7 @@ fn event_loop(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     app: &mut App,
 ) -> Result<()> {
+    let mut clipboard = crate::clipboard::ClipboardManager::new();
     loop {
         let term_height = terminal.size()?.height as usize;
         let lane_rows = term_height.saturating_sub(1 + 12 + 3);
@@ -208,6 +210,44 @@ fn event_loop(
         if event::poll(Duration::from_millis(50))? {
             match event::read()? {
                 Event::Key(key) if key.kind == KeyEventKind::Press => {
+                    if app.sequence.is_some() {
+                        match key.code {
+                            KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => {
+                                app.close_sequence();
+                            }
+                            KeyCode::Char('m') | KeyCode::Char('M') => {
+                                app.extend_sequence_median();
+                            }
+                            KeyCode::Char('y') | KeyCode::Char('Y') => {
+                                if let Some(csv) = app.sequence_csv() {
+                                    let mut out = stdout();
+                                    match clipboard.copy(&csv, &mut out) {
+                                        Ok(outcome) => {
+                                            let mut msg = String::new();
+                                            if outcome.via_native {
+                                                msg.push_str("copied to clipboard");
+                                            } else if outcome.via_osc52 {
+                                                msg.push_str("sent via OSC52");
+                                            } else {
+                                                msg.push_str("clipboard unavailable");
+                                            }
+                                            msg.push_str(&format!(
+                                                "; CSV also saved to {}",
+                                                outcome.file_path.display()
+                                            ));
+                                            app.sequence_status = Some(msg);
+                                        }
+                                        Err(e) => {
+                                            app.sequence_status =
+                                                Some(format!("copy failed: {}", e));
+                                        }
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
+                        continue;
+                    }
                     if app.search_active {
                         match key.code {
                             KeyCode::Esc => app.search_cancel(),
@@ -222,6 +262,9 @@ fn event_loop(
                         KeyCode::Char('q') | KeyCode::Char('Q') | KeyCode::Esc => break,
                         KeyCode::Char('/') => {
                             app.search_start();
+                        }
+                        KeyCode::Char('n') | KeyCode::Char('N') => {
+                            app.start_sequence();
                         }
                         KeyCode::Char('a') | KeyCode::Char('A') | KeyCode::Left => {
                             app.prev_item();
