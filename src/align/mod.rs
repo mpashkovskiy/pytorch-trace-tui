@@ -1,4 +1,4 @@
-use crate::trace::{AnnotationEvent, KernelEvent};
+use crate::trace::KernelEvent;
 
 mod match_blocks;
 mod nw;
