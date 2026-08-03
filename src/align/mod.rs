@@ -1,7 +1,9 @@
 use crate::trace::{AnnotationEvent, KernelEvent};
 
 mod match_blocks;
+mod nw;
 pub use match_blocks::match_blocks;
+pub use nw::align_block_pair;
 
 #[derive(Debug, Clone)]
 pub struct TimeSegment {
