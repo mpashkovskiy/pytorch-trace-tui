@@ -172,9 +172,10 @@ impl App {
             search_no_match: false,
             sequence: None,
             sequence_status: None,
-            diff_status: vec![DiffStatus::Matched; n_kernels],
+             diff_status: vec![DiffStatus::Matched; n_kernels],
         };
         app.clamp_selected_item();
+        app.compute_diff();
         app
     }
 
@@ -1965,8 +1966,9 @@ mod tests {
         app.move_to_lane_for_test(t1_kern_lane);
         let sel = app.selected_trace_item().unwrap();
         match sel {
-            // Aligned-nearest to 200 is t1.foo (aligned 200), not t1.bar (aligned 300).
-            SelectedTraceItem::Kernel(k) => assert_eq!(k.name, "foo"),
+            // compute_diff aligned t1.foo@9100 to display 100, t1.bar@9200 to 200.
+            // Selected T0.bar at aligned 200; nearest in T1 is t1.bar (aligned 200).
+            SelectedTraceItem::Kernel(k) => assert_eq!(k.name, "bar"),
             _ => panic!("expected kernel"),
         }
     }
@@ -2010,14 +2012,13 @@ mod tests {
     // S1: aligning to a selected kernel shifts other traces so their nearest
     // same-named kernel's start coincides with the selected kernel's start.
     #[test]
-    fn test_align_to_selected_kernel_shifts_others() {
-        // No shared annotation -> load offsets are 0; both traces raw.
-        // t0: gemm@200. t1: gemm@700. Selecting t0.gemm and aligning moves t1
-        // so t1.gemm aligned start == 200.
+     fn test_align_to_selected_kernel_shifts_others() {
+        // compute_diff auto-aligns at load: gemm@200 vs gemm@700 → offset -500.
+        // t0: gemm@200. t1: gemm@700.
         let t0 = trace_of(vec![kd(1, 200.0, "gemm", 8.0)], vec![]);
         let t1 = trace_of(vec![kd(1, 700.0, "gemm", 8.0)], vec![]);
         let mut app = App::new_multi(vec![("T0".into(), t0), ("T1".into(), t1)]);
-        assert_eq!(app.traces[1].offset_us, 0.0, "no annotation -> load offset 0");
+        assert_eq!(app.traces[1].offset_us, -500.0, "diff auto-aligns at load");
 
         select_kernel(&mut app, 0, "gemm");
         let ok = app.align_to_selected_kernel();
@@ -2205,11 +2206,21 @@ mod tests {
         app.compute_diff();
         // offset = t0_ts - t1_ts = 100 - 900 = -800
         assert!((app.traces[1].offset_us - (-800.0)).abs() < 1e-6, "offset={}", app.traces[1].offset_us);
-        // render_ts of matched pair should be equal
         let t0_gemm = app.kernels.iter().position(|k| k.trace_id == 0 && k.name == "gemm").unwrap();
         let t1_gemm = app.kernels.iter().position(|k| k.trace_id == 1 && k.name == "gemm").unwrap();
         let d0 = app.kernel_render_ts(t0_gemm);
         let d1 = app.kernel_render_ts(t1_gemm);
-        assert!((d0 - d1).abs() < 1e-6, "render_ts should be equal: {d0} vs {d1}");
+        assert!((d0 - d1).abs() < 1e-6, "render_ts equal: {d0} vs {d1}");
+    }
+
+    // T6: new_multi automatically runs compute_diff (no manual call needed)
+    #[test]
+    fn new_multi_runs_diff() {
+        let t0 = trace_of(vec![kd(1, 100.0, "gemm", 5.0)], vec![]);
+        let t1 = trace_of(vec![kd(1, 900.0, "extra", 5.0), kd(1, 910.0, "gemm", 5.0)], vec![]);
+        let app = App::new_multi(vec![("T0".into(), t0), ("T1".into(), t1)]);
+        let extra_idx = app.kernels.iter().position(|k| k.trace_id == 1 && k.name == "extra").unwrap();
+        assert_eq!(app.diff_status[extra_idx], DiffStatus::Added,
+            "new_multi must auto-run compute_diff");
     }
 }
