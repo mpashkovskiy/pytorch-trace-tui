@@ -189,7 +189,7 @@ fn render_header(frame: &mut Frame, area: Rect, app: &App) {
         Span::styled("Zoom: ", Style::new().fg(Color::DarkGray)),
         Span::styled(app.zoom_label(), Style::new().fg(Color::Magenta).bold()),
         Span::styled(
-            "  [/] search  [Tab/S-Tab] lane  [A/D] item  [W/S] zoom  [G] align  [Q] quit",
+            "  [/] search  [Tab/S-Tab] lane  [A/D] item  [W/S] zoom  [F] fit  [G] align  [Q] quit",
             Style::new().fg(Color::DarkGray),
         ),
     ]);

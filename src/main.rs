@@ -332,6 +332,9 @@ fn event_loop(
                         KeyCode::Char('s') | KeyCode::Char('S') | KeyCode::Down => {
                             app.zoom_out();
                         }
+                        KeyCode::Char('f') | KeyCode::Char('F') => {
+                            app.zoom_fit();
+                        }
                         KeyCode::Tab => {
                             app.next_lane();
                         }

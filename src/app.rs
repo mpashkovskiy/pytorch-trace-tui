@@ -138,6 +138,7 @@ pub struct App {
     pub active_lane: usize,
     pub selected_item: usize,
     pub zoom_level: f64,
+    pub zoom_mode: ZoomMode,
     pub lane_view_offset: usize,
     pub search_active: bool,
     pub search_query: String,
@@ -215,6 +216,7 @@ impl App {
             active_lane: initial_lane,
             selected_item: 0,
             zoom_level: 1.0,
+            zoom_mode: ZoomMode::Scale(1.0),
             lane_view_offset: 0,
             search_active: false,
             search_query: String::new(),
@@ -715,10 +717,16 @@ impl App {
 
     pub fn zoom_in(&mut self) {
         self.zoom_level *= ZOOM_FACTOR;
+        self.zoom_mode = ZoomMode::Scale(self.zoom_level);
     }
 
     pub fn zoom_out(&mut self) {
         self.zoom_level = (self.zoom_level / ZOOM_FACTOR).max(ZOOM_MIN);
+        self.zoom_mode = ZoomMode::Scale(self.zoom_level);
+    }
+
+    pub fn zoom_fit(&mut self) {
+        self.zoom_mode = ZoomMode::Fit;
     }
 
     // ── Search over BOTH lane kinds ──────────────────────────────────────────
@@ -986,6 +994,9 @@ impl App {
     }
 
     pub fn zoom_label(&self) -> String {
+        if self.zoom_mode == ZoomMode::Fit {
+            return "fit".to_string();
+        }
         let z = self.zoom_level;
         if z >= 10.0 {
             format!("{:.0}x", z)
@@ -1414,6 +1425,33 @@ mod tests {
         }
         assert!(app.zoom_level > 1e6);
         assert!(app.zoom_level.is_finite());
+    }
+
+    // Z: zoom_fit sets Fit mode; any zoom in/out returns to Scale tracking zoom_level.
+    #[test]
+    fn zoom_mode_toggle_and_return() {
+        let mut app = sample_app();
+        assert!(matches!(app.zoom_mode, ZoomMode::Scale(_)), "default Scale");
+        app.zoom_fit();
+        assert_eq!(app.zoom_mode, ZoomMode::Fit, "zoom_fit -> Fit");
+        app.zoom_in();
+        assert!(matches!(app.zoom_mode, ZoomMode::Scale(_)), "zoom_in returns to Scale");
+        app.zoom_fit();
+        assert_eq!(app.zoom_mode, ZoomMode::Fit);
+        app.zoom_out();
+        assert!(matches!(app.zoom_mode, ZoomMode::Scale(_)), "zoom_out returns to Scale");
+        // Scale tracks zoom_level.
+        if let ZoomMode::Scale(s) = app.zoom_mode {
+            assert!((s - app.zoom_level).abs() < 1e-9, "Scale mirrors zoom_level");
+        }
+    }
+
+    #[test]
+    fn zoom_label_shows_fit() {
+        let mut app = sample_app();
+        assert_ne!(app.zoom_label(), "fit");
+        app.zoom_fit();
+        assert_eq!(app.zoom_label(), "fit", "Fit mode labels as 'fit'");
     }
 
     #[test]
