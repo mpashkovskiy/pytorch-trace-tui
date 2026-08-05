@@ -213,6 +213,57 @@ impl App {
         self.traces.get(trace_id).map(|t| t.offset_us).unwrap_or(0.0)
     }
 
+    /// Runs Myers diff between trace 0 and trace 1 per stream and fills
+    /// `diff_status`. No-op for single-trace apps.
+    pub fn compute_diff(&mut self) {
+        if self.traces.len() < 2 {
+            return;
+        }
+        // Reset all to Matched first
+        for s in &mut self.diff_status {
+            *s = DiffStatus::Matched;
+        }
+        // Find streams present in both traces
+        let mut streams: Vec<u64> = self.kernels.iter().map(|k| k.stream).collect();
+        streams.sort_unstable();
+        streams.dedup();
+
+        for stream in streams {
+            // Collect per-trace kernel global indices for this stream, sorted by ts
+            let mut t0: Vec<usize> = self.kernels.iter().enumerate()
+                .filter(|(_, k)| k.trace_id == 0 && k.stream == stream)
+                .map(|(i, _)| i)
+                .collect();
+            let mut t1: Vec<usize> = self.kernels.iter().enumerate()
+                .filter(|(_, k)| k.trace_id == 1 && k.stream == stream)
+                .map(|(i, _)| i)
+                .collect();
+            if t0.is_empty() || t1.is_empty() {
+                // kernels only in one trace are Added/Removed
+                for &i in &t0 { self.diff_status[i] = DiffStatus::Removed; }
+                for &i in &t1 { self.diff_status[i] = DiffStatus::Added; }
+                continue;
+            }
+            t0.sort_by(|&a, &b| self.kernels[a].ts.partial_cmp(&self.kernels[b].ts)
+                .unwrap_or(std::cmp::Ordering::Equal));
+            t1.sort_by(|&a, &b| self.kernels[a].ts.partial_cmp(&self.kernels[b].ts)
+                .unwrap_or(std::cmp::Ordering::Equal));
+
+            let names0: Vec<&str> = t0.iter().map(|&i| self.kernels[i].name.as_str()).collect();
+            let names1: Vec<&str> = t1.iter().map(|&i| self.kernels[i].name.as_str()).collect();
+            let pairs = crate::diff::myers_lcs(&names0, &names1);
+
+            for (li, ri) in pairs {
+                match (li, ri) {
+                    (Some(a), Some(_)) => { self.diff_status[t0[a]] = DiffStatus::Matched; }
+                    (Some(a), None)    => { self.diff_status[t0[a]] = DiffStatus::Removed; }
+                    (None, Some(b))    => { self.diff_status[t1[b]] = DiffStatus::Added; }
+                    (None, None)       => {}
+                }
+            }
+        }
+    }
+
     /// Aligned start ts of kernel `idx`: raw ts + its trace's alignment offset.
     pub fn kernel_render_ts(&self, idx: usize) -> f64 {
         self.kernels
@@ -2056,5 +2107,62 @@ mod tests {
         ]);
         assert_eq!(app.diff_status.len(), app.kernels.len());
         assert!(app.diff_status.iter().all(|s| *s == crate::DiffStatus::Matched));
+    }
+
+    // ── compute_diff scenarios ───────────────────────────────────────────────
+
+    fn make_two_trace_app(t0_names: &[&str], t1_names: &[&str]) -> App {
+        let t0 = trace_of(
+            t0_names.iter().enumerate().map(|(i, n)| kd(1, i as f64 * 10.0, n, 5.0)).collect(),
+            vec![],
+        );
+        let t1 = trace_of(
+            t1_names.iter().enumerate().map(|(i, n)| kd(1, i as f64 * 10.0, n, 5.0)).collect(),
+            vec![],
+        );
+        App::new_multi(vec![("T0".into(), t0), ("T1".into(), t1)])
+    }
+
+    // S2: T1 has extra kernel absent in T0 -> Added
+    #[test]
+    fn compute_diff_added() {
+        let mut app = make_two_trace_app(&["gemm", "relu"], &["gemm", "extra", "relu"]);
+        app.compute_diff();
+        let extra_idx = app.kernels.iter().position(|k| k.trace_id == 1 && k.name == "extra").unwrap();
+        assert_eq!(app.diff_status[extra_idx], DiffStatus::Added);
+        let gemm_t1 = app.kernels.iter().position(|k| k.trace_id == 1 && k.name == "gemm").unwrap();
+        assert_eq!(app.diff_status[gemm_t1], DiffStatus::Matched);
+    }
+
+    // S3: T0 has kernel absent in T1 -> Removed
+    #[test]
+    fn compute_diff_removed() {
+        let mut app = make_two_trace_app(&["gemm", "bn", "relu"], &["gemm", "relu"]);
+        app.compute_diff();
+        let bn_idx = app.kernels.iter().position(|k| k.trace_id == 0 && k.name == "bn").unwrap();
+        assert_eq!(app.diff_status[bn_idx], DiffStatus::Removed);
+        let relu_t0 = app.kernels.iter().position(|k| k.trace_id == 0 && k.name == "relu").unwrap();
+        assert_eq!(app.diff_status[relu_t0], DiffStatus::Matched);
+    }
+
+    // S5: T0=[gemm,bn,relu], T1=[gemm,relu] - bn removed, gemm+relu matched
+    #[test]
+    fn compute_diff_mixed() {
+        let mut app = make_two_trace_app(&["gemm", "bn", "relu"], &["gemm", "relu"]);
+        app.compute_diff();
+        let gemm_t0 = app.kernels.iter().position(|k| k.trace_id == 0 && k.name == "gemm").unwrap();
+        let bn_t0   = app.kernels.iter().position(|k| k.trace_id == 0 && k.name == "bn").unwrap();
+        let relu_t0 = app.kernels.iter().position(|k| k.trace_id == 0 && k.name == "relu").unwrap();
+        assert_eq!(app.diff_status[gemm_t0], DiffStatus::Matched);
+        assert_eq!(app.diff_status[bn_t0],   DiffStatus::Removed);
+        assert_eq!(app.diff_status[relu_t0], DiffStatus::Matched);
+    }
+
+    // S4: single trace -> all remain Matched after compute_diff
+    #[test]
+    fn compute_diff_single_all_matched() {
+        let mut app = app_from(vec![make_kernel(1, 0.0, 5.0), make_kernel(1, 10.0, 5.0)]);
+        app.compute_diff();
+        assert!(app.diff_status.iter().all(|s| *s == DiffStatus::Matched));
     }
 }
