@@ -17,8 +17,6 @@ pub struct DiffColumnSlot {
 
 #[derive(Debug, Clone)]
 pub struct DiffStreamColumns {
-    #[allow(dead_code)] // consumed by annotation column rendering (W5)
-    pub stream_id: u64,
     pub slots: Vec<DiffColumnSlot>,
 }
 
@@ -36,7 +34,6 @@ pub enum VisualColumn {
 
 #[derive(Debug, Clone)]
 pub struct StreamLayout {
-    #[allow(dead_code)] // consumed by annotation column rendering (W5)
     pub stream_id: u64,
     pub columns: Vec<VisualColumn>,
     pub slot_to_visual_col: Vec<usize>,
@@ -309,7 +306,7 @@ impl App {
                     self.kernel_diff_column[g] = Some(KernelColumn { stream_id: stream, column: col });
                     slots.push(DiffColumnSlot { t0_kernel: None, t1_kernel: Some(g), lead_gap_cols: 0 });
                 }
-                self.diff_columns_by_stream.insert(stream, DiffStreamColumns { stream_id: stream, slots });
+                self.diff_columns_by_stream.insert(stream, DiffStreamColumns { slots });
                 continue;
             }
             t0.sort_by(|&a, &b| self.kernels[a].ts.partial_cmp(&self.kernels[b].ts)
@@ -352,7 +349,7 @@ impl App {
                     }
                 }
             }
-            self.diff_columns_by_stream.insert(stream, DiffStreamColumns { stream_id: stream, slots });
+            self.diff_columns_by_stream.insert(stream, DiffStreamColumns { slots });
         }
         self.fill_lead_gaps();
     }
@@ -421,7 +418,6 @@ impl App {
     // Visual-column [start,end] an annotation should span: the columns of the
     // kernels (same trace+stream) whose start ts falls within the annotation's
     // time span. Empty coverage falls back to the nearest kernel (1-col block).
-    #[allow(dead_code)] // consumed by annotation column rendering (W5)
     pub fn annotation_visual_span(
         &self,
         ann_idx: usize,
@@ -483,7 +479,11 @@ impl App {
                     && self.traces.len() == 2
                     && self.diff_columns_by_stream.contains_key(stream_id)
             }
-            Lane::Annotations { .. } => false,
+            Lane::Annotations { trace_id, stream_id, .. } => {
+                (*trace_id == 0 || *trace_id == 1)
+                    && self.traces.len() == 2
+                    && self.diff_columns_by_stream.contains_key(stream_id)
+            }
         }
     }
 
@@ -2868,6 +2868,36 @@ mod tests {
         let has_green = (0..120u16).any(|x| bg_at(&buf, x, yg) == Some(Color::Rgb(34, 197, 94)));
         assert!(has_red, "removed kernel must stay red even when merged in fit mode");
         assert!(has_green, "added kernel must stay green even when merged in fit mode");
+    }
+
+    // A1: an annotation covering a late kernel renders (in column space) with its
+    // right edge at that kernel's column, not at the annotation's raw timestamp.
+    #[test]
+    fn surface_annotation_aligns_to_kernel_column() {
+        use ratatui::style::Color;
+        let mut a0 = ann(1, 50.0, "region");
+        a0.dur = 200.0;
+        let ks = || vec![kd(1, 0.0, "A", 10.0), kd(1, 100.0, "B", 10.0), kd(1, 200.0, "C", 10.0)];
+        let t0 = trace_of(ks(), vec![a0]);
+        let t1 = trace_of(ks(), vec![]);
+        let mut app = App::new_multi(vec![("T0".into(), t0), ("T1".into(), t1)]);
+        for _ in 0..4 {
+            app.zoom_in();
+        }
+        let buf = render_buffer(&app);
+
+        let ann_lane = app.lanes.iter().position(|l| l.is_annotations() && l.trace_id() == 0).unwrap();
+        let kern_lane = app.lanes.iter().position(|l| !l.is_annotations() && l.trace_id() == 0).unwrap();
+        let ann_y = 2u16 + ann_lane as u16;
+        let kern_y = 2u16 + kern_lane as u16;
+
+        let ann_right = (0..120u16).rev().find(|&x| {
+            x < 118 && matches!(bg_at(&buf, x, ann_y), Some(c) if c != Color::Black)
+        });
+        let kern_starts: Vec<u16> = block_starts_in_row(&buf, kern_y).into_iter().filter(|&x| x < 118).collect();
+        let c_col = *kern_starts.last().unwrap();
+        let ar = ann_right.expect("annotation must render a colored block");
+        assert!(ar >= c_col.saturating_sub(2), "annotation end must align to C's column: ann_right={ar} c_col={c_col}");
     }
 
     // G1: idle before B (large) renders more leading blank columns than before C

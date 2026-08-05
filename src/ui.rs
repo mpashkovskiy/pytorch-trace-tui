@@ -415,7 +415,7 @@ fn build_lane_columns(app: &App, lane_idx: usize, width: usize) -> Vec<Span<'sta
     let (stream_id, trace_id) = match lane {
         crate::app::Lane::Kernels { stream_id, trace_id, .. } => (*stream_id, *trace_id),
         crate::app::Lane::Annotations { .. } => {
-            return build_lane(app, lane_idx, 0.0, 1.0, width);
+            return build_annotation_columns(app, lane_idx, width);
         }
     };
     let Some(layout) = app.stream_layout(stream_id) else {
@@ -551,6 +551,65 @@ fn selected_visual_col_for_stream(
         let frac = kc.column as f64 / active_slots as f64;
         Some(((frac * layout.total_cols as f64) as usize).min(layout.total_cols.saturating_sub(1)))
     }
+}
+
+// Render an annotation lane in column space: each annotation spans the visual
+// columns of the kernels it covers (by ts), so its end aligns to a kernel column
+// under the SAME viewport as the kernel lane of that stream (fit/zoom/idle-gaps).
+fn build_annotation_columns(app: &App, lane_idx: usize, width: usize) -> Vec<Span<'static>> {
+    let lane = &app.lanes[lane_idx];
+    let stream_id = lane.stream_id();
+    let Some(layout) = app.stream_layout(stream_id) else {
+        return build_lane(app, lane_idx, 0.0, 1.0, width);
+    };
+    if width == 0 || layout.total_cols == 0 {
+        return vec![Span::styled(" ".repeat(width), Style::new().bg(Color::Black))];
+    }
+    let selected_visual_col = selected_visual_col_for_stream(app, &layout, stream_id);
+    let vp = crate::app::resolve_viewport(app.zoom_mode, layout.total_cols, width, selected_visual_col);
+    let ann_bg = Color::Rgb(90, 90, 110);
+
+    // Paint each screen cell that falls inside any annotation's visual span.
+    let mut fills: Vec<Option<usize>> = vec![None; width];
+    for (pos, &ann_idx) in lane.item_indices().iter().enumerate() {
+        let Some((lo, hi)) = app.annotation_visual_span(ann_idx, &layout) else {
+            continue;
+        };
+        let x0 = (((lo as f64) - vp.window_start) * vp.scale).floor();
+        let x1 = ((((hi + 1) as f64) - vp.window_start) * vp.scale).ceil() - 1.0;
+        let x0 = x0.max(0.0) as usize;
+        let x1 = (x1.max(0.0) as usize).min(width.saturating_sub(1));
+        if x0 > x1 {
+            continue;
+        }
+        for cell in fills.iter_mut().take(x1 + 1).skip(x0) {
+            *cell = Some(pos);
+        }
+    }
+
+    let is_active_lane = lane_idx == app.active_lane;
+    let mut spans: Vec<Span<'static>> = Vec::with_capacity(width);
+    for (x, fill) in fills.iter().enumerate() {
+        match fill {
+            Some(pos) => {
+                let pos = *pos;
+                let ann_idx = lane.item_indices()[pos];
+                let name = app.annotations[ann_idx].name.as_str();
+                let selected = is_active_lane && pos == app.selected_item;
+                // First cell of this annotation's run shows its initial.
+                let first = x == 0 || fills[x - 1] != Some(pos);
+                let label = if first { ellipsize(name, 1) } else { " ".to_string() };
+                let style = if selected {
+                    Style::new().fg(Color::Black).bg(Color::White)
+                } else {
+                    Style::new().fg(Color::White).bg(ann_bg)
+                };
+                spans.push(Span::styled(label, style));
+            }
+            None => spans.push(Span::styled(" ".to_string(), Style::new().bg(Color::Black))),
+        }
+    }
+    spans
 }
 
 fn render_info_panel(frame: &mut Frame, area: Rect, app: &App) {
