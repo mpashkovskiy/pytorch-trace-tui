@@ -1,10 +1,29 @@
 use crate::trace::{AnnotationEvent, KernelEvent, Trace};
+use std::collections::BTreeMap;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum DiffStatus {
     Matched,
     Added,
     Removed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DiffColumnSlot {
+    pub t0_kernel: Option<usize>,
+    pub t1_kernel: Option<usize>,
+}
+
+#[derive(Debug, Clone)]
+pub struct DiffStreamColumns {
+    pub stream_id: u64,
+    pub slots: Vec<DiffColumnSlot>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KernelColumn {
+    pub stream_id: u64,
+    pub column: usize,
 }
 
 const ZOOM_MIN: f64 = 0.1;
@@ -98,6 +117,8 @@ pub struct App {
     pub sequence: Option<Sequence>,
     pub sequence_status: Option<String>,
     pub diff_status: Vec<DiffStatus>,
+    pub diff_columns_by_stream: BTreeMap<u64, DiffStreamColumns>,
+    pub kernel_diff_column: Vec<Option<KernelColumn>>,
 }
 
 impl App {
@@ -172,7 +193,9 @@ impl App {
             search_no_match: false,
             sequence: None,
             sequence_status: None,
-             diff_status: vec![DiffStatus::Matched; n_kernels],
+            diff_status: vec![DiffStatus::Matched; n_kernels],
+            diff_columns_by_stream: BTreeMap::new(),
+            kernel_diff_column: vec![None; n_kernels],
         };
         app.clamp_selected_item();
         app.compute_diff();
@@ -218,17 +241,17 @@ impl App {
         if self.traces.len() < 2 {
             return;
         }
-        // Reset all to Matched first
         for s in &mut self.diff_status {
             *s = DiffStatus::Matched;
         }
-        // Find streams present in both traces
+        self.diff_columns_by_stream.clear();
+        self.kernel_diff_column = vec![None; self.kernels.len()];
+
         let mut streams: Vec<u64> = self.kernels.iter().map(|k| k.stream).collect();
         streams.sort_unstable();
         streams.dedup();
 
         for stream in streams {
-            // Collect per-trace kernel global indices for this stream, sorted by ts
             let mut t0: Vec<usize> = self.kernels.iter().enumerate()
                 .filter(|(_, k)| k.trace_id == 0 && k.stream == stream)
                 .map(|(i, _)| i)
@@ -238,9 +261,23 @@ impl App {
                 .map(|(i, _)| i)
                 .collect();
             if t0.is_empty() || t1.is_empty() {
-                // kernels only in one trace are Added/Removed
-                for &i in &t0 { self.diff_status[i] = DiffStatus::Removed; }
-                for &i in &t1 { self.diff_status[i] = DiffStatus::Added; }
+                t0.sort_by(|&a, &b| self.kernels[a].ts.partial_cmp(&self.kernels[b].ts)
+                    .unwrap_or(std::cmp::Ordering::Equal));
+                t1.sort_by(|&a, &b| self.kernels[a].ts.partial_cmp(&self.kernels[b].ts)
+                    .unwrap_or(std::cmp::Ordering::Equal));
+                let mut slots: Vec<DiffColumnSlot> = Vec::new();
+                for (col, &g) in t0.iter().enumerate() {
+                    self.diff_status[g] = DiffStatus::Removed;
+                    self.kernel_diff_column[g] = Some(KernelColumn { stream_id: stream, column: col });
+                    slots.push(DiffColumnSlot { t0_kernel: Some(g), t1_kernel: None });
+                }
+                for (idx, &g) in t1.iter().enumerate() {
+                    let col = t0.len() + idx;
+                    self.diff_status[g] = DiffStatus::Added;
+                    self.kernel_diff_column[g] = Some(KernelColumn { stream_id: stream, column: col });
+                    slots.push(DiffColumnSlot { t0_kernel: None, t1_kernel: Some(g) });
+                }
+                self.diff_columns_by_stream.insert(stream, DiffStreamColumns { stream_id: stream, slots });
                 continue;
             }
             t0.sort_by(|&a, &b| self.kernels[a].ts.partial_cmp(&self.kernels[b].ts)
@@ -248,30 +285,42 @@ impl App {
             t1.sort_by(|&a, &b| self.kernels[a].ts.partial_cmp(&self.kernels[b].ts)
                 .unwrap_or(std::cmp::Ordering::Equal));
 
-            let names0: Vec<&str> = t0.iter().map(|&i| self.kernels[i].name.as_str()).collect();
-            let names1: Vec<&str> = t1.iter().map(|&i| self.kernels[i].name.as_str()).collect();
-            let pairs = crate::diff::myers_lcs(&names0, &names1);
+            let pairs = {
+                let names0: Vec<&str> = t0.iter().map(|&i| self.kernels[i].name.as_str()).collect();
+                let names1: Vec<&str> = t1.iter().map(|&i| self.kernels[i].name.as_str()).collect();
+                crate::diff::myers_lcs(&names0, &names1)
+            };
 
-            let mut offset_set = false;
-            for (li, ri) in pairs {
+            let mut slots: Vec<DiffColumnSlot> = Vec::with_capacity(pairs.len());
+            for (slot_idx, (li, ri)) in pairs.into_iter().enumerate() {
                 match (li, ri) {
                     (Some(a), Some(b)) => {
-                        self.diff_status[t0[a]] = DiffStatus::Matched;
-                        self.diff_status[t1[b]] = DiffStatus::Matched;
-                        if !offset_set {
-                            let t0_ts = self.kernels[t0[a]].ts;
-                            let t1_ts = self.kernels[t1[b]].ts;
-                            if let Some(meta) = self.traces.get_mut(1) {
-                                meta.offset_us = t0_ts - t1_ts;
-                            }
-                            offset_set = true;
-                        }
+                        let g0 = t0[a];
+                        let g1 = t1[b];
+                        self.diff_status[g0] = DiffStatus::Matched;
+                        self.diff_status[g1] = DiffStatus::Matched;
+                        self.kernel_diff_column[g0] = Some(KernelColumn { stream_id: stream, column: slot_idx });
+                        self.kernel_diff_column[g1] = Some(KernelColumn { stream_id: stream, column: slot_idx });
+                        slots.push(DiffColumnSlot { t0_kernel: Some(g0), t1_kernel: Some(g1) });
                     }
-                    (Some(a), None)    => { self.diff_status[t0[a]] = DiffStatus::Removed; }
-                    (None, Some(b))    => { self.diff_status[t1[b]] = DiffStatus::Added; }
-                    (None, None)       => {}
+                    (Some(a), None) => {
+                        let g0 = t0[a];
+                        self.diff_status[g0] = DiffStatus::Removed;
+                        self.kernel_diff_column[g0] = Some(KernelColumn { stream_id: stream, column: slot_idx });
+                        slots.push(DiffColumnSlot { t0_kernel: Some(g0), t1_kernel: None });
+                    }
+                    (None, Some(b)) => {
+                        let g1 = t1[b];
+                        self.diff_status[g1] = DiffStatus::Added;
+                        self.kernel_diff_column[g1] = Some(KernelColumn { stream_id: stream, column: slot_idx });
+                        slots.push(DiffColumnSlot { t0_kernel: None, t1_kernel: Some(g1) });
+                    }
+                    (None, None) => {
+                        slots.push(DiffColumnSlot { t0_kernel: None, t1_kernel: None });
+                    }
                 }
             }
+            self.diff_columns_by_stream.insert(stream, DiffStreamColumns { stream_id: stream, slots });
         }
     }
 
@@ -280,6 +329,20 @@ impl App {
             Some(DiffStatus::Added)   => Some(ratatui::style::Color::Rgb(34, 197, 94)),
             Some(DiffStatus::Removed) => Some(ratatui::style::Color::Rgb(220, 38, 38)),
             _                         => None,
+        }
+    }
+
+    pub fn use_gap_columns_for_lane(&self, lane_idx: usize) -> bool {
+        let Some(lane) = self.lanes.get(lane_idx) else {
+            return false;
+        };
+        match lane {
+            Lane::Kernels { trace_id, stream_id, .. } => {
+                (*trace_id == 0 || *trace_id == 1)
+                    && self.traces.len() == 2
+                    && self.diff_columns_by_stream.contains_key(stream_id)
+            }
+            Lane::Annotations { .. } => false,
         }
     }
 
@@ -422,12 +485,47 @@ impl App {
     }
 
     fn move_to_lane(&mut self, target: usize) {
+        // Gap-column lanes navigate in column space: carry the selected kernel's
+        // LCS column so the target lands on the same slot (or nearest present).
+        if self.use_gap_columns_for_lane(self.active_lane)
+            && self.use_gap_columns_for_lane(target)
+        {
+            if let Some(col) = self.selected_item_column() {
+                self.active_lane = target;
+                self.selected_item = self.nearest_present_item_by_column(col);
+                return;
+            }
+        }
         let prev_ts = self.selected_item_render_ts();
         self.active_lane = target;
         self.selected_item = match prev_ts {
             Some(ts) => self.nearest_item_in_active_lane(ts),
             None => 0,
         };
+    }
+
+    fn selected_item_column(&self) -> Option<usize> {
+        let lane = self.lanes.get(self.active_lane)?;
+        let idx = *lane.item_indices().get(self.selected_item)?;
+        self.kernel_diff_column.get(idx).copied().flatten().map(|kc| kc.column)
+    }
+
+    fn nearest_present_item_by_column(&self, target_col: usize) -> usize {
+        let Some(lane) = self.lanes.get(self.active_lane) else {
+            return 0;
+        };
+        let mut best = 0usize;
+        let mut best_diff = usize::MAX;
+        for (pos, &idx) in lane.item_indices().iter().enumerate() {
+            if let Some(kc) = self.kernel_diff_column.get(idx).copied().flatten() {
+                let diff = kc.column.abs_diff(target_col);
+                if diff < best_diff {
+                    best_diff = diff;
+                    best = pos;
+                }
+            }
+        }
+        best
     }
 
     #[cfg(test)]
@@ -1927,7 +2025,9 @@ mod tests {
     // visually-adjacent kernel is selected (this feature is for visual compare).
     #[test]
     fn test_tab_across_traces_uses_aligned_position() {
-        // t0: foo@100, bar@200 (anchor@100). t1: foo@9100->200, bar@9200->300 (anchor@9000).
+        // t0: foo@100, bar@200 (annotation@100). t1: foo@9100, bar@9200 (annotation@9000).
+        // No shared annotation name → both offsets 0.0 (raw timestamps).
+        // Selected T0.bar at render_ts 200; nearest in T1 is foo@9100 (distance 8900 vs bar@9200 distance 9000).
         let t0 = trace_of(
             vec![kd(1, 100.0, "foo", 5.0), kd(1, 200.0, "bar", 5.0)],
             vec![ann(1, 100.0, "step")],
@@ -1965,8 +2065,8 @@ mod tests {
         app.move_to_lane_for_test(t1_kern_lane);
         let sel = app.selected_trace_item().unwrap();
         match sel {
-            // compute_diff aligned t1.foo@9100 to display 100, t1.bar@9200 to 200.
-            // Selected T0.bar at aligned 200; nearest in T1 is t1.bar (aligned 200).
+            // Under gap-column layout, tab carries the LCS column: T0.bar is at
+            // slot 1 (foo=slot0, bar=slot1, both matched), so it lands on T1.bar.
             SelectedTraceItem::Kernel(k) => assert_eq!(k.name, "bar"),
             _ => panic!("expected kernel"),
         }
@@ -2012,12 +2112,12 @@ mod tests {
     // same-named kernel's start coincides with the selected kernel's start.
     #[test]
      fn test_align_to_selected_kernel_shifts_others() {
-        // compute_diff auto-aligns at load: gemm@200 vs gemm@700 → offset -500.
-        // t0: gemm@200. t1: gemm@700.
-        let t0 = trace_of(vec![kd(1, 200.0, "gemm", 8.0)], vec![]);
-        let t1 = trace_of(vec![kd(1, 700.0, "gemm", 8.0)], vec![]);
-        let mut app = App::new_multi(vec![("T0".into(), t0), ("T1".into(), t1)]);
-        assert_eq!(app.traces[1].offset_us, -500.0, "diff auto-aligns at load");
+         // compute_diff no longer auto-aligns: no shared annotations → offset 0.0.
+         // t0: gemm@200. t1: gemm@700.
+         let t0 = trace_of(vec![kd(1, 200.0, "gemm", 8.0)], vec![]);
+         let t1 = trace_of(vec![kd(1, 700.0, "gemm", 8.0)], vec![]);
+         let mut app = App::new_multi(vec![("T0".into(), t0), ("T1".into(), t1)]);
+         assert_eq!(app.traces[1].offset_us, 0.0, "no auto-offset under gap layout");
 
         select_kernel(&mut app, 0, "gemm");
         let ok = app.align_to_selected_kernel();
@@ -2184,6 +2284,51 @@ mod tests {
         assert!(app.diff_status.iter().all(|s| *s == DiffStatus::Matched));
     }
 
+    // S4: single-trace lanes never use gap columns (fall back to time layout).
+    #[test]
+    fn surface_s4_single_trace_no_gap_columns() {
+        let app = app_from(vec![make_kernel(1, 0.0, 5.0), make_kernel(1, 10.0, 5.0)]);
+        for idx in 0..app.lanes.len() {
+            assert!(!app.use_gap_columns_for_lane(idx), "single-trace lane {idx} must not use gap columns");
+        }
+    }
+
+    // S5: with N>2 traces, no lane uses gap columns (v1 supports exactly 2).
+    #[test]
+    fn surface_s5_three_traces_fallback() {
+        let t0 = trace_of(vec![kd(1, 0.0, "A", 5.0)], vec![]);
+        let t1 = trace_of(vec![kd(1, 0.0, "A", 5.0)], vec![]);
+        let t2 = trace_of(vec![kd(1, 0.0, "A", 5.0)], vec![]);
+        let app = App::new_multi(vec![("T0".into(), t0), ("T1".into(), t1), ("T2".into(), t2)]);
+        for idx in 0..app.lanes.len() {
+            assert!(!app.use_gap_columns_for_lane(idx), "N>2 lane {idx} must fall back to time layout");
+        }
+    }
+
+    // S8: navigating between diff lanes carries the LCS column; a present slot is
+    // selected, never a gap. Removed B (t0-only) maps to nearest present in t1.
+    #[test]
+    fn nav_diff_lane_carries_column() {
+        let mut app = make_two_trace_app(&["A", "B", "C"], &["A", "C"]);
+
+        select_kernel(&mut app, 0, "C");
+        let src = app.active_lane;
+        let t1_lane = app.lanes.iter().position(|l| l.trace_id() == 1 && !l.is_annotations()).unwrap();
+        app.move_to_lane_for_test(t1_lane);
+        let landed = app.lanes[app.active_lane].item_indices()[app.selected_item];
+        assert_eq!(app.kernels[landed].name, "C", "matched C must carry across to t1 C");
+
+        app.move_to_lane_for_test(src);
+        select_kernel(&mut app, 0, "B");
+        app.move_to_lane_for_test(t1_lane);
+        let landed = app.lanes[app.active_lane].item_indices()[app.selected_item];
+        assert!(
+            app.kernels[landed].name == "A" || app.kernels[landed].name == "C",
+            "removed B must land on nearest present kernel in t1, got {}",
+            app.kernels[landed].name,
+        );
+    }
+
     #[test]
     fn kernel_diff_color_variants() {
         use ratatui::style::Color;
@@ -2196,20 +2341,21 @@ mod tests {
         assert_eq!(app.kernel_diff_color(999),     None);
     }
 
-    // S1: after compute_diff, first matched pair sets offset so render_ts equal
+    // S1: after compute_diff, matched kernels share a column (no auto-offset under gap layout)
     #[test]
-    fn compute_diff_sets_offset() {
+    fn compute_diff_no_offset_matched_share_column() {
         let t0 = trace_of(vec![kd(1, 100.0, "gemm", 5.0)], vec![]);
         let t1 = trace_of(vec![kd(1, 900.0, "gemm", 5.0)], vec![]);
         let mut app = App::new_multi(vec![("T0".into(), t0), ("T1".into(), t1)]);
         app.compute_diff();
-        // offset = t0_ts - t1_ts = 100 - 900 = -800
-        assert!((app.traces[1].offset_us - (-800.0)).abs() < 1e-6, "offset={}", app.traces[1].offset_us);
+        // No shared annotations, so offset stays 0.0 (no auto-offset under gap layout)
+        assert!((app.traces[1].offset_us - 0.0).abs() < 1e-6, "no auto-offset: offset={}", app.traces[1].offset_us);
         let t0_gemm = app.kernels.iter().position(|k| k.trace_id == 0 && k.name == "gemm").unwrap();
         let t1_gemm = app.kernels.iter().position(|k| k.trace_id == 1 && k.name == "gemm").unwrap();
-        let d0 = app.kernel_render_ts(t0_gemm);
-        let d1 = app.kernel_render_ts(t1_gemm);
-        assert!((d0 - d1).abs() < 1e-6, "render_ts equal: {d0} vs {d1}");
+        // Matched kernels share the same column in kernel_diff_column
+        let col0 = app.kernel_diff_column[t0_gemm].unwrap().column;
+        let col1 = app.kernel_diff_column[t1_gemm].unwrap().column;
+        assert_eq!(col0, col1, "matched kernels share column");
     }
 
     // T6: new_multi automatically runs compute_diff (no manual call needed)
@@ -2335,5 +2481,218 @@ mod tests {
             .any(|(x, y)| bg_at(&buf, x, y) == Some(Color::Rgb(220, 38, 38)));
         assert!(!green, "single trace must have no green diff cells");
         assert!(!red,   "single trace must have no red diff cells");
+    }
+
+    // ── gap-aligned diff-layout render proofs (S1/S2/S3) ─────────────────────
+
+    // Locate the two stream-1 kernel-lane rows (T0 then T1, round-robin order).
+    // Lane rows sit inside the bordered block (│ at x=0) and carry a colored
+    // kernel block; the header line also mentions cuda:1 but has no border.
+    fn kernel_lane_rows(buf: &ratatui::buffer::Buffer) -> (u16, u16) {
+        use ratatui::style::Color;
+        let ys: Vec<u16> = (0..20u16)
+            .filter(|&y| {
+                let border = buf
+                    .cell(ratatui::prelude::Position { x: 0, y })
+                    .map(|c| c.symbol() == "\u{2502}")
+                    .unwrap_or(false);
+                let has_block = (0..120u16)
+                    .any(|x| matches!(bg_at(buf, x, y), Some(c) if c != Color::Black));
+                border && has_block
+            })
+            .collect();
+        assert!(ys.len() >= 2, "need 2 kernel lane rows, got {ys:?}");
+        (ys[0], ys[1])
+    }
+
+    // Start x of every contiguous colored (non-black, bg-set) block in the lane
+    // area. Lane cells carry an explicit bg; the label/border/separator do not,
+    // so scanning bg-set cells across the whole row isolates kernel blocks.
+    fn block_starts_in_row(buf: &ratatui::buffer::Buffer, y: u16) -> Vec<u16> {
+        use ratatui::style::Color;
+        let mut starts = Vec::new();
+        let mut prev_colored = false;
+        for x in 0..120u16 {
+            let colored = matches!(bg_at(buf, x, y), Some(c) if c != Color::Black);
+            if colored && !prev_colored {
+                starts.push(x);
+            }
+            prev_colored = colored;
+        }
+        starts
+    }
+
+    // S1 (gap): removed B is red in T0 lane; SAME column is a black gap in T1 lane.
+    #[test]
+    fn surface_s1_removed_gap() {
+        use ratatui::style::Color;
+        let app = make_two_trace_app(&["A", "B", "C"], &["A", "C"]);
+        let buf = render_buffer(&app);
+        let (yr, yg) = kernel_lane_rows(&buf);
+
+        let red_x = (0..120u16)
+            .find(|&x| bg_at(&buf, x, yr) == Some(Color::Rgb(220, 38, 38)))
+            .expect("removed B must render red in T0 lane");
+        assert_eq!(
+            bg_at(&buf, red_x, yg),
+            Some(Color::Black),
+            "T1 lane must be a black gap at removed-B column x={red_x}",
+        );
+
+        let s0 = block_starts_in_row(&buf, yr);
+        let s1 = block_starts_in_row(&buf, yg);
+        assert_eq!(s0.first(), s1.first(), "matched A must align: t0={s0:?} t1={s1:?}");
+        assert_eq!(s0.last(), s1.last(), "matched C must align: t0={s0:?} t1={s1:?}");
+    }
+
+    // S2 (gap): added B is green in T1 lane; SAME column is a black gap in T0 lane.
+    #[test]
+    fn surface_s2_added_gap() {
+        use ratatui::style::Color;
+        let app = make_two_trace_app(&["A", "C"], &["A", "B", "C"]);
+        let buf = render_buffer(&app);
+        let (yr, yg) = kernel_lane_rows(&buf);
+
+        let green_x = (0..120u16)
+            .find(|&x| bg_at(&buf, x, yg) == Some(Color::Rgb(34, 197, 94)))
+            .expect("added B must render green in T1 lane");
+        assert_eq!(
+            bg_at(&buf, green_x, yr),
+            Some(Color::Black),
+            "T0 lane must be a black gap at added-B column x={green_x}",
+        );
+
+        let s0 = block_starts_in_row(&buf, yr);
+        let s1 = block_starts_in_row(&buf, yg);
+        assert_eq!(s0.first(), s1.first(), "matched A must align: t0={s0:?} t1={s1:?}");
+        assert_eq!(s0.last(), s1.last(), "matched C must align: t0={s0:?} t1={s1:?}");
+    }
+
+    // S3 (gap): all matched -> no red/green; T0 and T1 lanes render an identical
+    // contiguous colored run (matched slots pack to the same columns in both).
+    #[test]
+    fn surface_s3_matched_no_gap() {
+        use ratatui::style::Color;
+        let app = make_two_trace_app(&["A", "B", "C"], &["A", "B", "C"]);
+        let buf = render_buffer(&app);
+        let (yr, yg) = kernel_lane_rows(&buf);
+
+        for y in [yr, yg] {
+            for x in 0..120u16 {
+                assert_ne!(bg_at(&buf, x, y), Some(Color::Rgb(220, 38, 38)), "no red at {x},{y}");
+                assert_ne!(bg_at(&buf, x, y), Some(Color::Rgb(34, 197, 94)), "no green at {x},{y}");
+            }
+        }
+
+        let s0 = block_starts_in_row(&buf, yr);
+        let s1 = block_starts_in_row(&buf, yg);
+        assert_eq!(s0, s1, "matched lanes must render identical columns: t0={s0:?} t1={s1:?}");
+        assert!(!s0.is_empty(), "matched kernels must render a colored run");
+
+        // Contiguous packing: the colored run has no interior black cell.
+        let first = *s0.first().unwrap();
+        let last_colored = (first..120u16)
+            .take_while(|&x| matches!(bg_at(&buf, x, yr), Some(c) if c != Color::Black))
+            .last()
+            .unwrap_or(first);
+        let interior_black = (first..last_colored)
+            .any(|x| bg_at(&buf, x, yr) == Some(Color::Black));
+        assert!(!interior_black, "matched slots must pack contiguously (no interior black gap)");
+    }
+
+    // ── diff-column data model (T2 RED phase) ────────────────────────────────
+
+    // D1: three matched kernels -> 3 slots, all with both sides present, and
+    // corresponding kernels share the same column index.
+    #[test]
+    fn diff_columns_matched_share_column() {
+        // Given: both traces carry A, B, C on stream 1
+        let app = make_two_trace_app(&["A", "B", "C"], &["A", "B", "C"]);
+        // Then: 3 diff column slots exist for stream 1
+        assert_eq!(app.diff_columns_by_stream[&1].slots.len(), 3);
+        // Then: every slot has both sides present (matched)
+        assert!(
+            app.diff_columns_by_stream[&1]
+                .slots
+                .iter()
+                .all(|s| s.t0_kernel.is_some() && s.t1_kernel.is_some()),
+            "all slots must be matched (both sides present)",
+        );
+        // Then: the "A" kernel from each trace maps to the same column
+        let a0 = app
+            .kernels
+            .iter()
+            .position(|k| k.name == "A" && k.trace_id == 0)
+            .expect("A in t0");
+        let a1 = app
+            .kernels
+            .iter()
+            .position(|k| k.name == "A" && k.trace_id == 1)
+            .expect("A in t1");
+        assert_eq!(
+            app.kernel_diff_column[a0].expect("a0 must have a column").column,
+            app.kernel_diff_column[a1].expect("a1 must have a column").column,
+            "matched A kernels must share a column index",
+        );
+    }
+
+    // D2: T0=[A,B,C], T1=[A,C] -> slot for B has t1_kernel=None; C kernels
+    // still share the same column in both traces.
+    #[test]
+    fn diff_columns_removed_makes_gap() {
+        // Given: T0 has B, T1 does not
+        let app = make_two_trace_app(&["A", "B", "C"], &["A", "C"]);
+        let slots = &app.diff_columns_by_stream[&1].slots;
+        // Then: at least one slot is a t0-only gap (B removed)
+        assert!(
+            slots.iter().any(|s| s.t1_kernel.is_none() && s.t0_kernel.is_some()),
+            "B (removed) must produce a slot with t0_kernel=Some, t1_kernel=None",
+        );
+        // Then: the C kernels in both traces share the same column
+        let c0 = app
+            .kernels
+            .iter()
+            .position(|k| k.name == "C" && k.trace_id == 0)
+            .expect("C in t0");
+        let c1 = app
+            .kernels
+            .iter()
+            .position(|k| k.name == "C" && k.trace_id == 1)
+            .expect("C in t1");
+        assert_eq!(
+            app.kernel_diff_column[c0].expect("c0 must have a column").column,
+            app.kernel_diff_column[c1].expect("c1 must have a column").column,
+            "matched C kernels must share a column index despite B gap",
+        );
+    }
+
+    // D3: T0=[A,C], T1=[A,B,C] -> slot for B has t0_kernel=None (B added).
+    #[test]
+    fn diff_columns_added_makes_gap() {
+        // Given: T1 has B, T0 does not
+        let app = make_two_trace_app(&["A", "C"], &["A", "B", "C"]);
+        let slots = &app.diff_columns_by_stream[&1].slots;
+        // Then: at least one slot is a t1-only gap (B added)
+        assert!(
+            slots.iter().any(|s| s.t0_kernel.is_none() && s.t1_kernel.is_some()),
+            "B (added) must produce a slot with t0_kernel=None, t1_kernel=Some",
+        );
+    }
+
+    // D4: compute_diff must NOT touch traces[1].offset_us (stays 0.0 from load).
+    #[test]
+    fn compute_diff_does_not_set_offset() {
+        // Given: two traces with "gemm" at very different timestamps, no shared annotation
+        let t0 = trace_of(vec![kd(1, 100.0, "gemm", 5.0)], vec![]);
+        let t1 = trace_of(vec![kd(1, 900.0, "gemm", 5.0)], vec![]);
+        // When: App::new_multi constructs the app (compute_diff runs inside)
+        let app = App::new_multi(vec![("T0".into(), t0), ("T1".into(), t1)]);
+        // Then: offset_us is 0.0 — compute_diff must not write it
+        assert_eq!(
+            app.traces[1].offset_us,
+            0.0,
+            "compute_diff must not modify offset_us; got {}",
+            app.traces[1].offset_us,
+        );
     }
 }

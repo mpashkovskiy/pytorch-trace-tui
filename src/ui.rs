@@ -282,7 +282,11 @@ fn render_lane(frame: &mut Frame, area: Rect, app: &App) {
             Span::styled(label_padded, label_style),
             Span::styled("│", Style::new().fg(Color::DarkGray)),
         ];
-        spans.extend(build_lane(app, lane_idx, ts_start, time_span, lane_width));
+        if app.use_gap_columns_for_lane(lane_idx) {
+            spans.extend(build_lane_columns(app, lane_idx, lane_width));
+        } else {
+            spans.extend(build_lane(app, lane_idx, ts_start, time_span, lane_width));
+        }
         lines.push(Line::from(spans));
     }
 
@@ -400,6 +404,123 @@ fn build_lane(
     }
 
     spans
+}
+
+// Gap-aligned diff layout: render one lane by LCS slot index rather than time.
+// Matched kernels in T0/T1 of a stream share the same slot -> same screen x;
+// a kernel present only in one trace draws a colored block in its lane and a
+// black blank gap at the same slot in the opposite lane.
+fn build_lane_columns(app: &App, lane_idx: usize, width: usize) -> Vec<Span<'static>> {
+    let lane = &app.lanes[lane_idx];
+    let (stream_id, trace_id) = match lane {
+        crate::app::Lane::Kernels { stream_id, trace_id, .. } => (*stream_id, *trace_id),
+        crate::app::Lane::Annotations { .. } => {
+            return build_lane(app, lane_idx, 0.0, 1.0, width);
+        }
+    };
+    let Some(columns) = app.diff_columns_by_stream.get(&stream_id) else {
+        return build_lane(app, lane_idx, 0.0, 1.0, width);
+    };
+    debug_assert_eq!(columns.stream_id, stream_id, "slot table keyed by its own stream");
+    let slots = &columns.slots;
+    let n_slots = slots.len();
+    if width == 0 || n_slots == 0 {
+        return vec![Span::styled(" ".repeat(width), Style::new().bg(Color::Black))];
+    }
+
+    let slot_width = (app.zoom_level.round() as usize).max(1);
+    let visible_slots = width.div_ceil(slot_width);
+    let window_start = column_window_start(app, lane_idx, n_slots, visible_slots);
+
+    let is_active_lane = lane_idx == app.active_lane;
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut cursor = 0usize;
+
+    for offset in 0..visible_slots {
+        let slot_idx = window_start + offset;
+        if slot_idx >= n_slots {
+            break;
+        }
+        let x = offset * slot_width;
+        if x >= width {
+            break;
+        }
+        let draw_width = slot_width.min(width - x);
+        let slot = slots[slot_idx];
+        let kernel_idx = if trace_id == 0 { slot.t0_kernel } else { slot.t1_kernel };
+
+        match kernel_idx {
+            Some(idx) => {
+                let base = kernel_color(app.kernels[idx].cat.as_str(), slot_idx);
+                let bg = app.kernel_diff_color(idx).unwrap_or(base);
+                let is_selected = is_active_lane
+                    && lane.item_indices().get(app.selected_item) == Some(&idx);
+                let name = app.kernels[idx].name.as_str();
+                let label = pad_to(ellipsize(name, draw_width), draw_width);
+                let style = if is_selected {
+                    Style::new().fg(Color::Black).bg(Color::White)
+                } else {
+                    Style::new().fg(Color::Black).bg(bg)
+                };
+                spans.push(Span::styled(label, style));
+            }
+            None => {
+                spans.push(Span::styled(
+                    " ".repeat(draw_width),
+                    Style::new().bg(Color::Black),
+                ));
+            }
+        }
+        cursor = x + draw_width;
+    }
+
+    if cursor < width {
+        spans.push(Span::styled(
+            " ".repeat(width - cursor),
+            Style::new().bg(Color::Black),
+        ));
+    }
+
+    spans
+}
+
+// First visible slot: center the window on the selected kernel's column for the
+// active lane's stream; other lanes track proportional progress so streams pan
+// together without a shared time axis.
+fn column_window_start(
+    app: &App,
+    lane_idx: usize,
+    n_slots: usize,
+    visible_slots: usize,
+) -> usize {
+    if visible_slots >= n_slots {
+        return 0;
+    }
+    let max_start = n_slots - visible_slots;
+    let lane = &app.lanes[lane_idx];
+
+    let center_col = app
+        .lanes
+        .get(app.active_lane)
+        .and_then(|active| {
+            let sel_idx = *active.item_indices().get(app.selected_item)?;
+            let kc = app.kernel_diff_column.get(sel_idx).copied().flatten()?;
+            if active.stream_id() == lane.stream_id() {
+                Some(kc.column)
+            } else {
+                let active_slots = app
+                    .diff_columns_by_stream
+                    .get(&active.stream_id())
+                    .map(|c| c.slots.len())
+                    .unwrap_or(1)
+                    .max(1);
+                let frac = kc.column as f64 / active_slots as f64;
+                Some((frac * n_slots as f64) as usize)
+            }
+        })
+        .unwrap_or(0);
+
+    center_col.saturating_sub(visible_slots / 2).min(max_start)
 }
 
 fn render_info_panel(frame: &mut Frame, area: Rect, app: &App) {
