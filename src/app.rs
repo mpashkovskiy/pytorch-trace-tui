@@ -2320,4 +2320,21 @@ mod tests {
             assert_ne!(bg1, Color::Rgb(220, 38, 38), "matched T1 must not be red");
         }
     }
+
+    // S4: single-trace renders no diff colors in the timeline
+    #[test]
+    fn render_single_trace_no_diff_color() {
+        use ratatui::style::Color;
+        let app = app_from(vec![
+            make_kernel(1, 0.0, 5.0),
+            make_kernel(1, 10.0, 5.0),
+        ]);
+        let buf = render_buffer(&app);
+        let green = (0..20u16).flat_map(|y| (0..120u16).map(move |x| (x, y)))
+            .any(|(x, y)| bg_at(&buf, x, y) == Some(Color::Rgb(34, 197, 94)));
+        let red = (0..20u16).flat_map(|y| (0..120u16).map(move |x| (x, y)))
+            .any(|(x, y)| bg_at(&buf, x, y) == Some(Color::Rgb(220, 38, 38)));
+        assert!(!green, "single trace must have no green diff cells");
+        assert!(!red,   "single trace must have no red diff cells");
+    }
 }
