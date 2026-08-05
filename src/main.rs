@@ -1,5 +1,6 @@
 mod app;
 mod clipboard;
+mod diff;
 mod trace;
 mod ui;
 
