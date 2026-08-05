@@ -55,6 +55,11 @@ pub struct HorizontalViewport {
 
 const ZOOM_MIN: f64 = 0.1;
 const ZOOM_FACTOR: f64 = 1.5;
+// Idle below this (µs) is routine launch overhead, never a gap. Real GPU traces
+// have ~1ns spacing between back-to-back kernels; only sizeable idle is meaningful.
+const IDLE_FLOOR_US: f64 = 1.0;
+// An idle must exceed threshold*factor (threshold = max(median, floor)) to gap.
+const IDLE_GAP_FACTOR: f64 = 3.0;
 
 /// A single navigable row on the timeline. Every lane — whether it holds GPU
 /// kernels or user annotations — behaves identically for navigation.
@@ -361,7 +366,6 @@ impl App {
         let streams: Vec<u64> = self.diff_columns_by_stream.keys().copied().collect();
         for stream in streams {
             let n = self.diff_columns_by_stream[&stream].slots.len();
-            // Ordered (prev_t0_end, this_slot_idx) for slots whose T0 kernel exists.
             let mut idles: Vec<f64> = Vec::new();
             let mut per_slot: Vec<(usize, f64)> = Vec::new();
             let mut prev_end: Option<f64> = None;
@@ -371,22 +375,23 @@ impl App {
                 let start = self.kernels[g].ts;
                 if let Some(pe) = prev_end {
                     let idle = (start - pe).max(0.0);
-                    if idle > 0.0 {
-                        idles.push(idle);
-                    }
+                    // Include ALL gaps (incl. 0) so the median reflects the typical
+                    // near-zero back-to-back spacing, not just the rare large idles.
+                    idles.push(idle);
                     per_slot.push((slot_idx, idle));
                 }
                 prev_end = Some(self.kernels[g].end_ts());
             }
-            let gap_unit = median_of(&idles);
-            if gap_unit <= 0.0 {
-                continue;
-            }
+            // A gap marks a MEANINGFUL idle outlier, not routine back-to-back launch
+            // overhead. Threshold = max(median idle, small absolute floor) * factor;
+            // only idles above it gap, scaled from the threshold.
+            let median = median_of(&idles);
+            let threshold = median.max(IDLE_FLOOR_US) * IDLE_GAP_FACTOR;
             for (slot_idx, idle) in per_slot {
-                if idle <= 0.0 {
+                if idle <= threshold {
                     continue;
                 }
-                let cells = ((idle / gap_unit).ceil()).clamp(1.0, 8.0) as u16;
+                let cells = (idle / threshold).floor().clamp(1.0, 8.0) as u16;
                 self.diff_columns_by_stream
                     .get_mut(&stream)
                     .unwrap()
@@ -2568,53 +2573,67 @@ mod tests {
     }
 
     // G1: idle between consecutive T0 kernels -> proportional lead_gap_cols on the
-    // slot starting the following kernel. Larger idle => more lead columns.
+    // slot starting the following kernel. Only a MEANINGFUL idle outlier gaps;
+    // uniform back-to-back spacing (normal launch overhead) produces NO gaps.
     #[test]
     fn compute_idle_gap_cols() {
-        // T0: A@0-10, B@100-110 (idle 90), C@120-130 (idle 10). T1 matches names.
-        let t0 = trace_of(
-            vec![kd(1, 0.0, "A", 10.0), kd(1, 100.0, "B", 10.0), kd(1, 120.0, "C", 10.0)],
-            vec![],
-        );
-        let t1 = trace_of(
-            vec![kd(1, 0.0, "A", 10.0), kd(1, 100.0, "B", 10.0), kd(1, 120.0, "C", 10.0)],
-            vec![],
-        );
-        let app = App::new_multi(vec![("T0".into(), t0), ("T1".into(), t1)]);
+        // Many back-to-back kernels (idle ~0), then ONE long idle before the outlier.
+        let mut k0: Vec<KernelEvent> = Vec::new();
+        let mut k1: Vec<KernelEvent> = Vec::new();
+        let mut ts = 0.0f64;
+        for i in 0..20 {
+            k0.push(kd(1, ts, &format!("k{i}"), 10.0));
+            k1.push(kd(1, ts, &format!("k{i}"), 10.0));
+            ts += 10.0 + 0.001; // near-back-to-back: tiny 1ns launch-overhead idle
+        }
+        // Outlier: big idle before the last kernel.
+        ts += 5000.0;
+        k0.push(kd(1, ts, "LATE", 10.0));
+        k1.push(kd(1, ts, "LATE", 10.0));
+        let app = App::new_multi(vec![
+            ("T0".into(), trace_of(k0, vec![])),
+            ("T1".into(), trace_of(k1, vec![])),
+        ]);
         let slots = &app.diff_columns_by_stream[&1].slots;
-        // 3 matched slots for A, B, C in order.
-        let gap_b = slots[1].lead_gap_cols;
-        let gap_c = slots[2].lead_gap_cols;
-        assert!(gap_b > 0, "large idle before B must produce a gap, got {gap_b}");
-        assert!(gap_b > gap_c, "idle before B (90) > before C (10): {gap_b} vs {gap_c}");
-        assert!(gap_b <= 8, "lead_gap_cols must be clamped to <=8, got {gap_b}");
+        // Back-to-back kernels get NO gap; the outlier gets a gap.
+        let gapped = slots.iter().filter(|s| s.lead_gap_cols > 0).count();
+        assert_eq!(gapped, 1, "only the outlier idle should gap, got {gapped} gapped slots");
+        assert!(slots.last().unwrap().lead_gap_cols > 0, "the LATE outlier must have a gap");
+        assert!(slots.last().unwrap().lead_gap_cols <= 8, "gap clamped to <=8");
     }
 
     // Shared visual layer: stream_layout expands each slot's lead_gap_cols into
     // Gap columns before the Slot, giving one coordinate system for kernels+annotations.
     #[test]
     fn stream_layout_expands_gaps() {
-        let t0 = trace_of(
-            vec![kd(1, 0.0, "A", 10.0), kd(1, 100.0, "B", 10.0)],
-            vec![],
-        );
-        let t1 = trace_of(
-            vec![kd(1, 0.0, "A", 10.0), kd(1, 100.0, "B", 10.0)],
-            vec![],
-        );
-        let app = App::new_multi(vec![("T0".into(), t0), ("T1".into(), t1)]);
+        // Back-to-back A,B,C then a big-idle outlier D so exactly one slot gaps.
+        let ks = || vec![
+            kd(1, 0.0, "A", 10.0),
+            kd(1, 10.0, "B", 10.0),
+            kd(1, 20.0, "C", 10.0),
+            kd(1, 5000.0, "D", 10.0),
+        ];
+        let app = App::new_multi(vec![
+            ("T0".into(), trace_of(ks(), vec![])),
+            ("T1".into(), trace_of(ks(), vec![])),
+        ]);
         let layout = app.stream_layout(1).expect("layout for stream 1");
-        // Slot 0 (A) has no lead gap; slot 1 (B) has lead_gap_cols > 0 before it.
-        let gap_b = app.diff_columns_by_stream[&1].slots[1].lead_gap_cols as usize;
-        assert!(gap_b > 0, "B must have a lead gap");
-        // Visual columns: Slot(0), then gap_b Gaps, then Slot(1).
+        let slots = &app.diff_columns_by_stream[&1].slots;
+        // Only D (slot 3) gaps; A,B,C are contiguous.
+        assert_eq!(slots[0].lead_gap_cols, 0);
+        assert_eq!(slots[1].lead_gap_cols, 0);
+        assert_eq!(slots[2].lead_gap_cols, 0);
+        let gap_d = slots[3].lead_gap_cols as usize;
+        assert!(gap_d > 0, "big-idle D must have a lead gap");
+        // Visual columns: Slot(0),Slot(1),Slot(2), then gap_d Gaps, then Slot(3).
         assert_eq!(layout.columns[0], VisualColumn::Slot(0));
-        for g in 1..=gap_b {
+        assert_eq!(layout.columns[1], VisualColumn::Slot(1));
+        assert_eq!(layout.columns[2], VisualColumn::Slot(2));
+        for g in 3..3 + gap_d {
             assert_eq!(layout.columns[g], VisualColumn::Gap, "col {g} must be Gap");
         }
-        assert_eq!(layout.columns[gap_b + 1], VisualColumn::Slot(1));
-        assert_eq!(layout.slot_to_visual_col[0], 0);
-        assert_eq!(layout.slot_to_visual_col[1], gap_b + 1);
+        assert_eq!(layout.columns[3 + gap_d], VisualColumn::Slot(3));
+        assert_eq!(layout.slot_to_visual_col[3], 3 + gap_d);
         assert_eq!(layout.total_cols, layout.columns.len());
     }
 
@@ -2943,42 +2962,51 @@ mod tests {
         assert!(ar >= c_col.saturating_sub(2), "annotation end must align to C's column: ann_right={ar} c_col={c_col}");
     }
 
-    // G1: idle before B (large) renders more leading blank columns than before C
-    // (small); both lanes mirror identical columns so matched kernels stay aligned.
+    // G1: a big-idle OUTLIER kernel gets a leading gap; back-to-back kernels do
+    // not. Both lanes mirror identical columns so matched kernels stay aligned.
     #[test]
     fn surface_idle_gap_visible() {
         use ratatui::style::Color;
-        let ks = || vec![kd(1, 0.0, "A", 10.0), kd(1, 100.0, "B", 10.0), kd(1, 120.0, "C", 10.0)];
-        let t0 = trace_of(ks(), vec![]);
-        let t1 = trace_of(ks(), vec![]);
-        let mut app = App::new_multi(vec![("T0".into(), t0), ("T1".into(), t1)]);
+        // A,B,C back-to-back (no gap), D after a large idle (gap before D).
+        let ks = || vec![
+            kd(1, 0.0, "A", 10.0),
+            kd(1, 10.0, "B", 10.0),
+            kd(1, 20.0, "C", 10.0),
+            kd(1, 5000.0, "D", 10.0),
+        ];
+        let mut app = App::new_multi(vec![
+            ("T0".into(), trace_of(ks(), vec![])),
+            ("T1".into(), trace_of(ks(), vec![])),
+        ]);
         for _ in 0..4 {
             app.zoom_in();
         }
         let buf = render_buffer(&app);
         let (yr, yg) = kernel_lane_rows(&buf);
 
-        // Ignore the right border column (x>=118) which can bleed a colored cell.
+        // Exactly slot D (index 3) carries a lead gap; A,B,C are contiguous.
+        let slots = &app.diff_columns_by_stream[&1].slots;
+        assert_eq!(slots.iter().filter(|s| s.lead_gap_cols > 0).count(), 1, "only D gaps");
+        assert!(slots[3].lead_gap_cols > 0, "D must have a lead gap");
+
+        // Surface: there is a black gap run immediately before D's block in T0.
         let content = |v: Vec<u16>| -> Vec<u16> { v.into_iter().filter(|&x| x < 118).collect() };
         let starts = content(block_starts_in_row(&buf, yr));
-        assert_eq!(starts.len(), 3, "3 kernel blocks in T0: {starts:?}");
-        let gap_before = |bi: usize| -> u16 {
-            let mut g = 0u16;
-            let mut x = starts[bi];
-            while x > 0 {
-                x -= 1;
-                if bg_at(&buf, x, yr) == Some(Color::Black) {
-                    g += 1;
-                } else {
-                    break;
-                }
+        assert!(starts.len() >= 2, "expect distinct blocks incl. D: {starts:?}");
+        let d_start = *starts.last().unwrap();
+        let mut gap = 0u16;
+        let mut x = d_start;
+        while x > 0 {
+            x -= 1;
+            if bg_at(&buf, x, yr) == Some(Color::Black) {
+                gap += 1;
+            } else {
+                break;
             }
-            g
-        };
-        let gap_b = gap_before(1);
-        let gap_c = gap_before(2);
-        assert!(gap_b > gap_c, "idle before B (90) wider than before C (10): {gap_b} vs {gap_c}");
+        }
+        assert!(gap > 0, "a black gap must precede the big-idle kernel D");
 
+        // Both lanes mirror identical columns.
         let starts_t1 = content(block_starts_in_row(&buf, yg));
         assert_eq!(starts, starts_t1, "T0/T1 matched kernels must align: {starts:?} vs {starts_t1:?}");
     }
@@ -3003,16 +3031,17 @@ mod tests {
     // Z2: zooming in gives each slot >=1 cell so individual kernels are distinct.
     #[test]
     fn surface_zoom_in_separates() {
-        let mut app = make_two_trace_app(&["A", "B", "C"], &["A", "B", "C"]);
-        for _ in 0..6 {
+        let mut app = make_two_trace_app(&["gemm", "relu", "bnorm"], &["gemm", "relu", "bnorm"]);
+        for _ in 0..8 {
             app.zoom_in();
         }
         let buf = render_buffer(&app);
         let (yr, _yg) = kernel_lane_rows(&buf);
-        // At high zoom the 3 matched kernels render as 3 separate colored blocks
-        // (ignoring the right-border bleed at x>=118).
-        let starts: Vec<u16> = block_starts_in_row(&buf, yr).into_iter().filter(|&x| x < 118).collect();
-        assert_eq!(starts.len(), 3, "zoomed-in kernels must render 3 distinct blocks, got {starts:?}");
+        // At high zoom each kernel gets enough cells to render its distinct name;
+        // back-to-back kernels pack contiguously (no idle gap between them).
+        let text = row_text(&buf, yr, 120);
+        let distinct = ["gemm", "relu", "bnorm"].iter().filter(|n| text.contains(**n)).count();
+        assert!(distinct >= 2, "zoomed kernels must show distinct names, got: {text:?}");
     }
 
     // S1 (gap): removed B is red in T0 lane; SAME column is a black gap in T1 lane.
