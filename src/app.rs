@@ -12,6 +12,7 @@ pub enum DiffStatus {
 pub struct DiffColumnSlot {
     pub t0_kernel: Option<usize>,
     pub t1_kernel: Option<usize>,
+    pub lead_gap_cols: u16,
 }
 
 #[derive(Debug, Clone)]
@@ -24,6 +25,37 @@ pub struct DiffStreamColumns {
 pub struct KernelColumn {
     pub stream_id: u64,
     pub column: usize,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VisualColumn {
+    Gap,
+    Slot(usize),
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+pub struct StreamLayout {
+    pub stream_id: u64,
+    pub columns: Vec<VisualColumn>,
+    pub slot_to_visual_col: Vec<usize>,
+    pub total_cols: usize,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ZoomMode {
+    Scale(f64),
+    Fit,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct HorizontalViewport {
+    pub scale: f64,
+    pub window_start: f64,
+    pub width: usize,
 }
 
 const ZOOM_MIN: f64 = 0.1;
@@ -269,13 +301,13 @@ impl App {
                 for (col, &g) in t0.iter().enumerate() {
                     self.diff_status[g] = DiffStatus::Removed;
                     self.kernel_diff_column[g] = Some(KernelColumn { stream_id: stream, column: col });
-                    slots.push(DiffColumnSlot { t0_kernel: Some(g), t1_kernel: None });
+                    slots.push(DiffColumnSlot { t0_kernel: Some(g), t1_kernel: None, lead_gap_cols: 0 });
                 }
                 for (idx, &g) in t1.iter().enumerate() {
                     let col = t0.len() + idx;
                     self.diff_status[g] = DiffStatus::Added;
                     self.kernel_diff_column[g] = Some(KernelColumn { stream_id: stream, column: col });
-                    slots.push(DiffColumnSlot { t0_kernel: None, t1_kernel: Some(g) });
+                    slots.push(DiffColumnSlot { t0_kernel: None, t1_kernel: Some(g), lead_gap_cols: 0 });
                 }
                 self.diff_columns_by_stream.insert(stream, DiffStreamColumns { stream_id: stream, slots });
                 continue;
@@ -301,22 +333,22 @@ impl App {
                         self.diff_status[g1] = DiffStatus::Matched;
                         self.kernel_diff_column[g0] = Some(KernelColumn { stream_id: stream, column: slot_idx });
                         self.kernel_diff_column[g1] = Some(KernelColumn { stream_id: stream, column: slot_idx });
-                        slots.push(DiffColumnSlot { t0_kernel: Some(g0), t1_kernel: Some(g1) });
+                        slots.push(DiffColumnSlot { t0_kernel: Some(g0), t1_kernel: Some(g1), lead_gap_cols: 0 });
                     }
                     (Some(a), None) => {
                         let g0 = t0[a];
                         self.diff_status[g0] = DiffStatus::Removed;
                         self.kernel_diff_column[g0] = Some(KernelColumn { stream_id: stream, column: slot_idx });
-                        slots.push(DiffColumnSlot { t0_kernel: Some(g0), t1_kernel: None });
+                        slots.push(DiffColumnSlot { t0_kernel: Some(g0), t1_kernel: None, lead_gap_cols: 0 });
                     }
                     (None, Some(b)) => {
                         let g1 = t1[b];
                         self.diff_status[g1] = DiffStatus::Added;
                         self.kernel_diff_column[g1] = Some(KernelColumn { stream_id: stream, column: slot_idx });
-                        slots.push(DiffColumnSlot { t0_kernel: None, t1_kernel: Some(g1) });
+                        slots.push(DiffColumnSlot { t0_kernel: None, t1_kernel: Some(g1), lead_gap_cols: 0 });
                     }
                     (None, None) => {
-                        slots.push(DiffColumnSlot { t0_kernel: None, t1_kernel: None });
+                        slots.push(DiffColumnSlot { t0_kernel: None, t1_kernel: None, lead_gap_cols: 0 });
                     }
                 }
             }
