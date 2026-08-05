@@ -490,9 +490,9 @@ impl App {
         if self.use_gap_columns_for_lane(self.active_lane)
             && self.use_gap_columns_for_lane(target)
         {
-            if let Some(col) = self.selected_item_column() {
+            if let Some(kc) = self.selected_item_column() {
                 self.active_lane = target;
-                self.selected_item = self.nearest_present_item_by_column(col);
+                self.selected_item = self.nearest_present_item_by_column(kc);
                 return;
             }
         }
@@ -504,13 +504,13 @@ impl App {
         };
     }
 
-    fn selected_item_column(&self) -> Option<usize> {
+    fn selected_item_column(&self) -> Option<KernelColumn> {
         let lane = self.lanes.get(self.active_lane)?;
         let idx = *lane.item_indices().get(self.selected_item)?;
-        self.kernel_diff_column.get(idx).copied().flatten().map(|kc| kc.column)
+        self.kernel_diff_column.get(idx).copied().flatten()
     }
 
-    fn nearest_present_item_by_column(&self, target_col: usize) -> usize {
+    fn nearest_present_item_by_column(&self, target: KernelColumn) -> usize {
         let Some(lane) = self.lanes.get(self.active_lane) else {
             return 0;
         };
@@ -518,7 +518,10 @@ impl App {
         let mut best_diff = usize::MAX;
         for (pos, &idx) in lane.item_indices().iter().enumerate() {
             if let Some(kc) = self.kernel_diff_column.get(idx).copied().flatten() {
-                let diff = kc.column.abs_diff(target_col);
+                if kc.stream_id != target.stream_id {
+                    continue;
+                }
+                let diff = kc.column.abs_diff(target.column);
                 if diff < best_diff {
                     best_diff = diff;
                     best = pos;

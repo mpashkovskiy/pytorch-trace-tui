@@ -502,6 +502,7 @@ fn column_window_start(
     let center_col = app
         .lanes
         .get(app.active_lane)
+        .filter(|active| matches!(active, crate::app::Lane::Kernels { .. }))
         .and_then(|active| {
             let sel_idx = *active.item_indices().get(app.selected_item)?;
             let kc = app.kernel_diff_column.get(sel_idx).copied().flatten()?;
