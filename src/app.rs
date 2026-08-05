@@ -2870,6 +2870,46 @@ mod tests {
         assert!(has_green, "added kernel must stay green even when merged in fit mode");
     }
 
+    // G1: idle before B (large) renders more leading blank columns than before C
+    // (small); both lanes mirror identical columns so matched kernels stay aligned.
+    #[test]
+    fn surface_idle_gap_visible() {
+        use ratatui::style::Color;
+        let ks = || vec![kd(1, 0.0, "A", 10.0), kd(1, 100.0, "B", 10.0), kd(1, 120.0, "C", 10.0)];
+        let t0 = trace_of(ks(), vec![]);
+        let t1 = trace_of(ks(), vec![]);
+        let mut app = App::new_multi(vec![("T0".into(), t0), ("T1".into(), t1)]);
+        for _ in 0..4 {
+            app.zoom_in();
+        }
+        let buf = render_buffer(&app);
+        let (yr, yg) = kernel_lane_rows(&buf);
+
+        // Ignore the right border column (x>=118) which can bleed a colored cell.
+        let content = |v: Vec<u16>| -> Vec<u16> { v.into_iter().filter(|&x| x < 118).collect() };
+        let starts = content(block_starts_in_row(&buf, yr));
+        assert_eq!(starts.len(), 3, "3 kernel blocks in T0: {starts:?}");
+        let gap_before = |bi: usize| -> u16 {
+            let mut g = 0u16;
+            let mut x = starts[bi];
+            while x > 0 {
+                x -= 1;
+                if bg_at(&buf, x, yr) == Some(Color::Black) {
+                    g += 1;
+                } else {
+                    break;
+                }
+            }
+            g
+        };
+        let gap_b = gap_before(1);
+        let gap_c = gap_before(2);
+        assert!(gap_b > gap_c, "idle before B (90) wider than before C (10): {gap_b} vs {gap_c}");
+
+        let starts_t1 = content(block_starts_in_row(&buf, yg));
+        assert_eq!(starts, starts_t1, "T0/T1 matched kernels must align: {starts:?} vs {starts_t1:?}");
+    }
+
     // Z2: zooming in gives each slot >=1 cell so individual kernels are distinct.
     #[test]
     fn surface_zoom_in_separates() {
