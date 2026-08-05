@@ -2223,4 +2223,101 @@ mod tests {
         assert_eq!(app.diff_status[extra_idx], DiffStatus::Added,
             "new_multi must auto-run compute_diff");
     }
+
+    // ── TestBackend render proofs (S1/S2/S3) ─────────────────────────────────
+
+    fn render_buffer(app: &App) -> ratatui::buffer::Buffer {
+        use ratatui::{backend::TestBackend, Terminal};
+        let mut t = Terminal::new(TestBackend::new(120, 20)).unwrap();
+        t.draw(|f| crate::ui::render(f, app)).unwrap();
+        t.backend().buffer().clone()
+    }
+
+    fn bg_at(buf: &ratatui::buffer::Buffer, x: u16, y: u16) -> Option<ratatui::style::Color> {
+        buf.cell(ratatui::prelude::Position { x, y })
+            .map(|c| c.style().bg)
+            .and_then(|b| b)
+    }
+
+    fn first_kernel_col_in_row(buf: &ratatui::buffer::Buffer, y: u16, w: u16)
+        -> Option<(u16, ratatui::style::Color)>
+    {
+        let sep = (0..w).find(|&x| {
+            buf.cell(ratatui::prelude::Position { x, y })
+               .map(|c| c.symbol() == "\u{2502}")  // │
+               .unwrap_or(false)
+        })?;
+        // First non-space cell after the separator
+        for x in (sep + 1)..w {
+            if let Some(cell) = buf.cell(ratatui::prelude::Position { x, y }) {
+                if cell.symbol() != " " {
+                    if let Some(bg) = cell.style().bg {
+                        return Some((x, bg));
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    // S2: Added kernel renders with GREEN_DIFF background
+    #[test]
+    fn render_added_cell_green() {
+        use ratatui::style::Color;
+        let t0 = trace_of(vec![kd(1, 0.0, "gemm", 5.0)], vec![]);
+        let t1 = trace_of(vec![kd(1, 0.0, "gemm", 5.0), kd(1, 10.0, "extra", 5.0)], vec![]);
+        let app = App::new_multi(vec![("T0".into(), t0), ("T1".into(), t1)]);
+        let buf = render_buffer(&app);
+        let found_green = (0..20u16).flat_map(|y| (0..120u16).map(move |x| (x, y)))
+            .any(|(x, y)| bg_at(&buf, x, y) == Some(Color::Rgb(34, 197, 94)));
+        assert!(found_green, "Added kernel must render with GREEN_DIFF background");
+    }
+
+    // S3: Removed kernel renders with RED_DIFF background
+    #[test]
+    fn render_removed_cell_red() {
+        use ratatui::style::Color;
+        let t0 = trace_of(vec![kd(1, 0.0, "gemm", 5.0), kd(1, 10.0, "bn", 5.0)], vec![]);
+        let t1 = trace_of(vec![kd(1, 0.0, "gemm", 5.0)], vec![]);
+        let app = App::new_multi(vec![("T0".into(), t0), ("T1".into(), t1)]);
+        let buf = render_buffer(&app);
+        let found_red = (0..20u16).flat_map(|y| (0..120u16).map(move |x| (x, y)))
+            .any(|(x, y)| bg_at(&buf, x, y) == Some(Color::Rgb(220, 38, 38)));
+        assert!(found_red, "Removed kernel must render with RED_DIFF background");
+    }
+
+    // S1: matched kernels render at same column, not with diff colors
+    #[test]
+    fn render_matched_same_column() {
+        use ratatui::style::Color;
+        // Both traces have gemm at different raw ts; compute_diff matches them
+        let t0 = trace_of(vec![kd(1, 100.0, "gemm", 8.0)], vec![]);
+        let t1 = trace_of(vec![kd(1, 500.0, "gemm", 8.0)], vec![]);
+        let app = App::new_multi(vec![("T0".into(), t0), ("T1".into(), t1)]);
+        let buf = render_buffer(&app);
+
+        // Find T0 and T1 kernel lane rows
+        let rows: Vec<(String, u16)> = (0..20u16)
+            .filter_map(|y| {
+                let row: String = (0..120u16).map(|x|
+                    buf.cell(ratatui::prelude::Position { x, y })
+                       .map(|c| c.symbol())
+                       .unwrap_or(" ")
+                       .chars().next().unwrap_or(' ')
+                ).collect();
+                if row.contains("cuda:1") { Some((row, y)) } else { None }
+            })
+            .collect();
+        assert!(rows.len() >= 2, "need 2 kernel lanes: {:?}", rows.iter().map(|r| r.1).collect::<Vec<_>>());
+
+        let col0 = first_kernel_col_in_row(&buf, rows[0].1, 120);
+        let col1 = first_kernel_col_in_row(&buf, rows[1].1, 120);
+        if let (Some((c0, bg0)), Some((c1, bg1))) = (col0, col1) {
+            assert_eq!(c0, c1, "matched gemm must start at same column; T0 col={c0}, T1 col={c1}");
+            assert_ne!(bg0, Color::Rgb(34, 197, 94), "matched T0 must not be green");
+            assert_ne!(bg0, Color::Rgb(220, 38, 38), "matched T0 must not be red");
+            assert_ne!(bg1, Color::Rgb(34, 197, 94), "matched T1 must not be green");
+            assert_ne!(bg1, Color::Rgb(220, 38, 38), "matched T1 must not be red");
+        }
+    }
 }
