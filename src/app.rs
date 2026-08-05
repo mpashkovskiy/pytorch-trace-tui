@@ -1,5 +1,12 @@
 use crate::trace::{AnnotationEvent, KernelEvent, Trace};
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum DiffStatus {
+    Matched,
+    Added,
+    Removed,
+}
+
 const ZOOM_MIN: f64 = 0.1;
 const ZOOM_FACTOR: f64 = 1.5;
 
@@ -90,6 +97,7 @@ pub struct App {
     pub search_no_match: bool,
     pub sequence: Option<Sequence>,
     pub sequence_status: Option<String>,
+    pub diff_status: Vec<DiffStatus>,
 }
 
 impl App {
@@ -148,6 +156,7 @@ impl App {
             .position(|l| !l.is_annotations())
             .unwrap_or(0);
 
+        let n_kernels = kernels.len();
         let mut app = App {
             kernels,
             annotations,
@@ -163,6 +172,7 @@ impl App {
             search_no_match: false,
             sequence: None,
             sequence_status: None,
+            diff_status: vec![DiffStatus::Matched; n_kernels],
         };
         app.clamp_selected_item();
         app
@@ -923,7 +933,6 @@ fn median_of(durs: &[f64]) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::trace::{AnnotationEvent, KernelEvent, Trace};
 
     fn app_from(kernels: Vec<KernelEvent>) -> App {
         App::new(Trace {
@@ -2037,5 +2046,15 @@ mod tests {
         // Common prefix "a" + suffix "c" would leave one empty -> index fallback.
         let labels = vec!["ac".to_string(), "abc".to_string()];
         assert_eq!(shorten_labels(&labels), vec!["T0", "T1"]);
+    }
+
+    #[test]
+    fn diff_status_defaults_matched() {
+        let app = app_from(vec![
+            make_kernel(1, 0.0, 5.0),
+            make_kernel(1, 10.0, 5.0),
+        ]);
+        assert_eq!(app.diff_status.len(), app.kernels.len());
+        assert!(app.diff_status.iter().all(|s| *s == crate::DiffStatus::Matched));
     }
 }

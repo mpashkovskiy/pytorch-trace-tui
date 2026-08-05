@@ -4,6 +4,8 @@ mod diff;
 mod trace;
 mod ui;
 
+pub use app::DiffStatus;
+
 use anyhow::{bail, Context, Result};
 use app::App;
 use clap::Parser;
