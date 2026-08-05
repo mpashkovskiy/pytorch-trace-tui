@@ -354,21 +354,20 @@ impl App {
             if tid == ref_trace {
                 continue;
             }
-            let nearest = self
+            let nearest_raw = self
                 .kernels
                 .iter()
-                .enumerate()
-                .filter(|(_, k)| k.trace_id == tid && k.name == name)
-                .map(|(i, _)| self.kernel_render_ts(i))
+                .filter(|k| k.trace_id == tid && k.name == name)
+                .map(|k| k.ts)
                 .min_by(|a, b| {
                     (a - target)
                         .abs()
                         .partial_cmp(&(b - target).abs())
                         .unwrap_or(std::cmp::Ordering::Equal)
                 });
-            if let Some(aligned_start) = nearest {
+            if let Some(raw_start) = nearest_raw {
                 if let Some(meta) = self.traces.get_mut(tid) {
-                    meta.offset_us += target - aligned_start;
+                    meta.offset_us = target - raw_start;
                 }
             }
         }
