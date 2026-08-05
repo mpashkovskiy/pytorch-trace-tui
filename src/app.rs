@@ -213,8 +213,6 @@ impl App {
         self.traces.get(trace_id).map(|t| t.offset_us).unwrap_or(0.0)
     }
 
-    /// Runs Myers diff between trace 0 and trace 1 per stream and fills
-    /// `diff_status`. No-op for single-trace apps.
     pub fn compute_diff(&mut self) {
         if self.traces.len() < 2 {
             return;
@@ -261,6 +259,14 @@ impl App {
                     (None, None)       => {}
                 }
             }
+        }
+    }
+
+    pub fn kernel_diff_color(&self, idx: usize) -> Option<ratatui::style::Color> {
+        match self.diff_status.get(idx) {
+            Some(DiffStatus::Added)   => Some(ratatui::style::Color::Rgb(34, 197, 94)),
+            Some(DiffStatus::Removed) => Some(ratatui::style::Color::Rgb(220, 38, 38)),
+            _                         => None,
         }
     }
 
@@ -2164,5 +2170,17 @@ mod tests {
         let mut app = app_from(vec![make_kernel(1, 0.0, 5.0), make_kernel(1, 10.0, 5.0)]);
         app.compute_diff();
         assert!(app.diff_status.iter().all(|s| *s == DiffStatus::Matched));
+    }
+
+    #[test]
+    fn kernel_diff_color_variants() {
+        use ratatui::style::Color;
+        let mut app = make_two_trace_app(&["gemm"], &["relu"]);
+        app.compute_diff();
+        let removed = app.kernels.iter().position(|k| k.trace_id == 0).unwrap();
+        let added   = app.kernels.iter().position(|k| k.trace_id == 1).unwrap();
+        assert_eq!(app.kernel_diff_color(removed), Some(Color::Rgb(220, 38, 38)));
+        assert_eq!(app.kernel_diff_color(added),   Some(Color::Rgb(34, 197, 94)));
+        assert_eq!(app.kernel_diff_color(999),     None);
     }
 }
