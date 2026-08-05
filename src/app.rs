@@ -251,9 +251,21 @@ impl App {
             let names1: Vec<&str> = t1.iter().map(|&i| self.kernels[i].name.as_str()).collect();
             let pairs = crate::diff::myers_lcs(&names0, &names1);
 
+            let mut offset_set = false;
             for (li, ri) in pairs {
                 match (li, ri) {
-                    (Some(a), Some(_)) => { self.diff_status[t0[a]] = DiffStatus::Matched; }
+                    (Some(a), Some(b)) => {
+                        self.diff_status[t0[a]] = DiffStatus::Matched;
+                        self.diff_status[t1[b]] = DiffStatus::Matched;
+                        if !offset_set {
+                            let t0_ts = self.kernels[t0[a]].ts;
+                            let t1_ts = self.kernels[t1[b]].ts;
+                            if let Some(meta) = self.traces.get_mut(1) {
+                                meta.offset_us = t0_ts - t1_ts;
+                            }
+                            offset_set = true;
+                        }
+                    }
                     (Some(a), None)    => { self.diff_status[t0[a]] = DiffStatus::Removed; }
                     (None, Some(b))    => { self.diff_status[t1[b]] = DiffStatus::Added; }
                     (None, None)       => {}
@@ -2182,5 +2194,22 @@ mod tests {
         assert_eq!(app.kernel_diff_color(removed), Some(Color::Rgb(220, 38, 38)));
         assert_eq!(app.kernel_diff_color(added),   Some(Color::Rgb(34, 197, 94)));
         assert_eq!(app.kernel_diff_color(999),     None);
+    }
+
+    // S1: after compute_diff, first matched pair sets offset so render_ts equal
+    #[test]
+    fn compute_diff_sets_offset() {
+        let t0 = trace_of(vec![kd(1, 100.0, "gemm", 5.0)], vec![]);
+        let t1 = trace_of(vec![kd(1, 900.0, "gemm", 5.0)], vec![]);
+        let mut app = App::new_multi(vec![("T0".into(), t0), ("T1".into(), t1)]);
+        app.compute_diff();
+        // offset = t0_ts - t1_ts = 100 - 900 = -800
+        assert!((app.traces[1].offset_us - (-800.0)).abs() < 1e-6, "offset={}", app.traces[1].offset_us);
+        // render_ts of matched pair should be equal
+        let t0_gemm = app.kernels.iter().position(|k| k.trace_id == 0 && k.name == "gemm").unwrap();
+        let t1_gemm = app.kernels.iter().position(|k| k.trace_id == 1 && k.name == "gemm").unwrap();
+        let d0 = app.kernel_render_ts(t0_gemm);
+        let d1 = app.kernel_render_ts(t1_gemm);
+        assert!((d0 - d1).abs() < 1e-6, "render_ts should be equal: {d0} vs {d1}");
     }
 }
