@@ -575,10 +575,14 @@ fn build_annotation_columns(app: &App, lane_idx: usize, width: usize) -> Vec<Spa
         let Some((lo, hi)) = app.annotation_visual_span(ann_idx, &layout) else {
             continue;
         };
-        let x0 = (((lo as f64) - vp.window_start) * vp.scale).floor();
-        let x1 = ((((hi + 1) as f64) - vp.window_start) * vp.scale).ceil() - 1.0;
-        let x0 = x0.max(0.0) as usize;
-        let x1 = (x1.max(0.0) as usize).min(width.saturating_sub(1));
+        let x0_raw = (((lo as f64) - vp.window_start) * vp.scale).floor();
+        let x1_raw = ((((hi + 1) as f64) - vp.window_start) * vp.scale).ceil() - 1.0;
+        // Skip spans entirely outside the viewport (else clamping bleeds into cell 0).
+        if x1_raw < 0.0 || x0_raw >= width as f64 {
+            continue;
+        }
+        let x0 = x0_raw.max(0.0) as usize;
+        let x1 = (x1_raw.max(0.0) as usize).min(width.saturating_sub(1));
         if x0 > x1 {
             continue;
         }

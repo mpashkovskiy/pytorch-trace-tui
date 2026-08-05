@@ -2838,15 +2838,19 @@ mod tests {
     // no clipping off the right edge).
     #[test]
     fn surface_fit_shows_all() {
+        use ratatui::style::Color;
         let mut app = make_many_kernel_app(300);
         app.zoom_fit();
         let layout = app.stream_layout(1).unwrap();
         assert!(layout.total_cols > 118, "test needs more cols than width");
         let buf = render_buffer(&app);
         let (yr, _yg) = kernel_lane_rows(&buf);
-        // Fit compresses everything: colored cells reach near the right edge of the lane.
-        let rightmost = (0..120u16).rev().find(|&x| bg_at(&buf, x, yr).is_some());
-        assert!(rightmost.unwrap_or(0) > 100, "fit must fill lane width, got {rightmost:?}");
+        // Fit compresses the whole sequence: real (non-black) kernel color must reach
+        // near the right edge of the lane, proving every slot is represented.
+        let rightmost = (0..118u16)
+            .rev()
+            .find(|&x| matches!(bg_at(&buf, x, yr), Some(c) if c != Color::Black));
+        assert!(rightmost.unwrap_or(0) > 100, "fit must fill lane width with kernels, got {rightmost:?}");
     }
 
     // Z1: a removed/added kernel merged into a compressed cell still shows its diff color.
@@ -2868,6 +2872,32 @@ mod tests {
         let has_green = (0..120u16).any(|x| bg_at(&buf, x, yg) == Some(Color::Rgb(34, 197, 94)));
         assert!(has_red, "removed kernel must stay red even when merged in fit mode");
         assert!(has_green, "added kernel must stay green even when merged in fit mode");
+    }
+
+    // A1: an annotation whose span is entirely left of the viewport must NOT paint
+    // cell 0 (no offscreen-left bleed).
+    #[test]
+    fn surface_annotation_no_offscreen_left_bleed() {
+        use ratatui::style::Color;
+        let n = 300usize;
+        let mk = || -> Vec<KernelEvent> {
+            (0..n).map(|i| kd(1, i as f64 * 10.0, &format!("k{i}"), 5.0)).collect()
+        };
+        let mut a0 = ann(1, 0.0, "early");
+        a0.dur = 5.0; // covers only k0 (ts 0..5), far left of a right-panned viewport
+        let t0 = trace_of(mk(), vec![a0]);
+        let t1 = trace_of(mk(), vec![]);
+        let mut app = App::new_multi(vec![("T0".into(), t0), ("T1".into(), t1)]);
+        for _ in 0..6 {
+            app.zoom_in();
+        }
+        select_kernel(&mut app, 0, &format!("k{}", n - 1));
+        let buf = render_buffer(&app);
+        let ann_lane = app.lanes.iter().position(|l| l.is_annotations() && l.trace_id() == 0).unwrap();
+        let ann_y = 2u16 + ann_lane as u16;
+        let ann_bg = Color::Rgb(90, 90, 110);
+        let bled = (0..120u16).any(|x| bg_at(&buf, x, ann_y) == Some(ann_bg));
+        assert!(!bled, "offscreen-left annotation must not bleed into the viewport");
     }
 
     // A1: an annotation covering a late kernel renders (in column space) with its
@@ -2949,9 +2979,10 @@ mod tests {
         }
         let buf = render_buffer(&app);
         let (yr, _yg) = kernel_lane_rows(&buf);
-        // At high zoom, the 3 kernels occupy wide, distinct blocks.
-        let colored = (0..120u16).filter(|&x| bg_at(&buf, x, yr).is_some()).count();
-        assert!(colored >= 3, "zoomed-in kernels must render distinct cells, got {colored}");
+        // At high zoom the 3 matched kernels render as 3 separate colored blocks
+        // (ignoring the right-border bleed at x>=118).
+        let starts: Vec<u16> = block_starts_in_row(&buf, yr).into_iter().filter(|&x| x < 118).collect();
+        assert_eq!(starts.len(), 3, "zoomed-in kernels must render 3 distinct blocks, got {starts:?}");
     }
 
     // S1 (gap): removed B is red in T0 lane; SAME column is a black gap in T1 lane.
