@@ -436,31 +436,57 @@ fn build_lane_columns(app: &App, lane_idx: usize, width: usize) -> Vec<Span<'sta
         None
     };
 
-    let mut spans: Vec<Span<'static>> = Vec::with_capacity(width);
+    // Resolve each screen cell to (kernel_idx, color): the dominant kernel and the
+    // per-lane diff color for the visual columns that cell covers.
+    #[derive(Clone, Copy, PartialEq)]
+    struct Cell {
+        kernel: Option<usize>,
+        color: Color,
+        selected: bool,
+    }
+    let mut cells: Vec<Cell> = Vec::with_capacity(width);
     for x in 0..width {
         let a = vp.window_start + x as f64 / vp.scale;
         let b = vp.window_start + (x + 1) as f64 / vp.scale;
         let start = (a.floor().max(0.0) as usize).min(layout.total_cols);
         let end = (b.ceil() as usize).clamp(start, layout.total_cols);
-        let cols = if start < end {
-            &layout.columns[start..end]
+        let cols = if start < end { &layout.columns[start..end] } else { &[][..] };
+
+        let kernel = first_cell_kernel(cols, slots, trace_id);
+        let selected = selected_kernel.is_some() && kernel == selected_kernel;
+        let color = if selected {
+            Color::White
         } else {
-            &[][..]
+            aggregate_kernel_cell_color(app, cols, slots, trace_id)
         };
+        cells.push(Cell { kernel, color, selected });
+    }
 
-        // Single-slot cell that holds the selected kernel: highlight it.
-        let selected_here = selected_kernel.is_some_and(|sk| {
-            cols.iter().any(|c| matches!(c, crate::app::VisualColumn::Slot(i)
-                if slot_kernel(slots, *i, trace_id) == Some(sk)))
-        });
-
-        let (label, style) = if selected_here {
-            (label_for_cell(app, cols, slots, trace_id), Style::new().fg(Color::Black).bg(Color::White))
+    // Group consecutive cells sharing the same kernel into one span so the kernel's
+    // full name is written across the block width (readable when zoomed in).
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut x = 0usize;
+    while x < width {
+        let cell = cells[x];
+        let mut run = 1usize;
+        while x + run < width
+            && cells[x + run].kernel == cell.kernel
+            && cells[x + run].color == cell.color
+            && cells[x + run].selected == cell.selected
+        {
+            run += 1;
+        }
+        let label = match cell.kernel {
+            Some(idx) => pad_to(ellipsize(app.kernels[idx].name.as_str(), run), run),
+            None => " ".repeat(run),
+        };
+        let style = if cell.selected {
+            Style::new().fg(Color::Black).bg(Color::White)
         } else {
-            let color = aggregate_kernel_cell_color(app, cols, slots, trace_id);
-            (label_for_cell(app, cols, slots, trace_id), Style::new().fg(Color::Black).bg(color))
+            Style::new().fg(Color::Black).bg(cell.color)
         };
         spans.push(Span::styled(label, style));
+        x += run;
     }
     spans
 }
@@ -470,22 +496,20 @@ fn slot_kernel(slots: &[crate::app::DiffColumnSlot], slot_idx: usize, trace_id: 
     if trace_id == 0 { slot.t0_kernel } else { slot.t1_kernel }
 }
 
-// One label char for a cell: the first covered kernel's initial, else space.
-fn label_for_cell(
-    app: &App,
+// The kernel occupying the first Slot column in a cell's range (for its label).
+fn first_cell_kernel(
     cols: &[crate::app::VisualColumn],
     slots: &[crate::app::DiffColumnSlot],
     trace_id: usize,
-) -> String {
+) -> Option<usize> {
     for c in cols {
         if let crate::app::VisualColumn::Slot(i) = c {
             if let Some(idx) = slot_kernel(slots, *i, trace_id) {
-                let name = app.kernels[idx].name.as_str();
-                return ellipsize(name, 1);
+                return Some(idx);
             }
         }
     }
-    " ".to_string()
+    None
 }
 
 // Per-lane color for a compressed cell covering a range of visual columns.

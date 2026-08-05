@@ -2689,6 +2689,19 @@ mod tests {
             .and_then(|b| b)
     }
 
+    fn row_text(buf: &ratatui::buffer::Buffer, y: u16, w: u16) -> String {
+        (0..w)
+            .map(|x| {
+                buf.cell(ratatui::prelude::Position { x, y })
+                    .map(|c| c.symbol())
+                    .unwrap_or(" ")
+                    .chars()
+                    .next()
+                    .unwrap_or(' ')
+            })
+            .collect()
+    }
+
     fn first_kernel_col_in_row(buf: &ratatui::buffer::Buffer, y: u16, w: u16)
         -> Option<(u16, ratatui::style::Color)>
     {
@@ -2968,6 +2981,23 @@ mod tests {
 
         let starts_t1 = content(block_starts_in_row(&buf, yg));
         assert_eq!(starts, starts_t1, "T0/T1 matched kernels must align: {starts:?} vs {starts_t1:?}");
+    }
+
+    // Bug: a kernel spanning many cells must show its NAME across the run, not a
+    // single initial. At high zoom "gemm" should render as readable text.
+    #[test]
+    fn surface_zoomed_kernel_shows_full_name() {
+        let mut app = make_two_trace_app(&["gemm", "relu"], &["gemm", "relu"]);
+        for _ in 0..8 {
+            app.zoom_in();
+        }
+        let buf = render_buffer(&app);
+        let (yr, _yg) = kernel_lane_rows(&buf);
+        let text = row_text(&buf, yr, 120);
+        assert!(
+            text.contains("gemm") || text.contains("relu"),
+            "zoomed kernel must render its full name, got: {text:?}"
+        );
     }
 
     // Z2: zooming in gives each slot >=1 cell so individual kernels are distinct.
