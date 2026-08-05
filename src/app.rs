@@ -27,14 +27,12 @@ pub struct KernelColumn {
     pub column: usize,
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VisualColumn {
     Gap,
     Slot(usize),
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct StreamLayout {
     pub stream_id: u64,
@@ -43,14 +41,12 @@ pub struct StreamLayout {
     pub total_cols: usize,
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ZoomMode {
     Scale(f64),
     Fit,
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct HorizontalViewport {
     pub scale: f64,
@@ -354,6 +350,114 @@ impl App {
             }
             self.diff_columns_by_stream.insert(stream, DiffStreamColumns { stream_id: stream, slots });
         }
+        self.fill_lead_gaps();
+    }
+
+    // Idle time between consecutive T0 kernels becomes proportional blank columns
+    // (lead_gap_cols) before the slot that starts the following kernel, so the
+    // reference trace's real spacing survives contiguous column packing.
+    fn fill_lead_gaps(&mut self) {
+        let streams: Vec<u64> = self.diff_columns_by_stream.keys().copied().collect();
+        for stream in streams {
+            let n = self.diff_columns_by_stream[&stream].slots.len();
+            // Ordered (prev_t0_end, this_slot_idx) for slots whose T0 kernel exists.
+            let mut idles: Vec<f64> = Vec::new();
+            let mut per_slot: Vec<(usize, f64)> = Vec::new();
+            let mut prev_end: Option<f64> = None;
+            for slot_idx in 0..n {
+                let t0 = self.diff_columns_by_stream[&stream].slots[slot_idx].t0_kernel;
+                let Some(g) = t0 else { continue };
+                let start = self.kernels[g].ts;
+                if let Some(pe) = prev_end {
+                    let idle = (start - pe).max(0.0);
+                    if idle > 0.0 {
+                        idles.push(idle);
+                    }
+                    per_slot.push((slot_idx, idle));
+                }
+                prev_end = Some(self.kernels[g].end_ts());
+            }
+            let gap_unit = median_of(&idles);
+            if gap_unit <= 0.0 {
+                continue;
+            }
+            for (slot_idx, idle) in per_slot {
+                if idle <= 0.0 {
+                    continue;
+                }
+                let cells = ((idle / gap_unit).ceil()).clamp(1.0, 8.0) as u16;
+                self.diff_columns_by_stream
+                    .get_mut(&stream)
+                    .unwrap()
+                    .slots[slot_idx]
+                    .lead_gap_cols = cells;
+            }
+        }
+    }
+
+    pub fn stream_layout(&self, stream_id: u64) -> Option<StreamLayout> {
+        let slots = &self.diff_columns_by_stream.get(&stream_id)?.slots;
+        let mut columns: Vec<VisualColumn> = Vec::new();
+        let mut slot_to_visual_col = vec![0usize; slots.len()];
+        for (slot_idx, slot) in slots.iter().enumerate() {
+            for _ in 0..slot.lead_gap_cols {
+                columns.push(VisualColumn::Gap);
+            }
+            slot_to_visual_col[slot_idx] = columns.len();
+            columns.push(VisualColumn::Slot(slot_idx));
+        }
+        Some(StreamLayout {
+            stream_id,
+            total_cols: columns.len(),
+            columns,
+            slot_to_visual_col,
+        })
+    }
+
+    // Visual-column [start,end] an annotation should span: the columns of the
+    // kernels (same trace+stream) whose start ts falls within the annotation's
+    // time span. Empty coverage falls back to the nearest kernel (1-col block).
+    pub fn annotation_visual_span(
+        &self,
+        ann_idx: usize,
+        layout: &StreamLayout,
+    ) -> Option<(usize, usize)> {
+        let ann = self.annotations.get(ann_idx)?;
+        let ann_start = ann.ts;
+        let ann_end = ann.end_ts();
+
+        let mut covered_cols: Vec<usize> = Vec::new();
+        for (kidx, k) in self.kernels.iter().enumerate() {
+            if k.trace_id != ann.trace_id || k.stream != ann.stream {
+                continue;
+            }
+            if k.ts >= ann_start && k.ts <= ann_end {
+                if let Some(kc) = self.kernel_diff_column.get(kidx).copied().flatten() {
+                    if kc.stream_id == layout.stream_id {
+                        if let Some(&vc) = layout.slot_to_visual_col.get(kc.column) {
+                            covered_cols.push(vc);
+                        }
+                    }
+                }
+            }
+        }
+        if let (Some(&lo), Some(&hi)) = (covered_cols.iter().min(), covered_cols.iter().max()) {
+            return Some((lo, hi));
+        }
+
+        // Fallback: nearest kernel by ts in the same trace+stream, minimal 1 col.
+        let nearest = self
+            .kernels
+            .iter()
+            .enumerate()
+            .filter(|(_, k)| k.trace_id == ann.trace_id && k.stream == ann.stream)
+            .min_by(|(_, a), (_, b)| {
+                (a.ts - ann_start).abs().total_cmp(&(b.ts - ann_start).abs())
+            })
+            .map(|(i, _)| i)?;
+        let kc = self.kernel_diff_column.get(nearest).copied().flatten()?;
+        let vc = *layout.slot_to_visual_col.get(kc.column)?;
+        Some((vc, vc))
     }
 
     pub fn kernel_diff_color(&self, idx: usize) -> Option<ratatui::style::Color> {
@@ -1129,6 +1233,35 @@ fn median_of(durs: &[f64]) -> f64 {
         finite[n / 2]
     } else {
         (finite[n / 2 - 1] + finite[n / 2]) / 2.0
+    }
+}
+
+// Horizontal viewport for column rendering. Fit compresses every visual column
+// into `width` cells (scale may be < 1, many columns per cell); Scale keeps
+// `scale` cells per column and centers the window on the selected column.
+fn resolve_viewport(
+    mode: ZoomMode,
+    total_cols: usize,
+    width: usize,
+    selected_visual_col: Option<usize>,
+) -> HorizontalViewport {
+    if total_cols == 0 || width == 0 {
+        return HorizontalViewport { scale: 1.0, window_start: 0.0, width };
+    }
+    match mode {
+        ZoomMode::Fit => HorizontalViewport {
+            scale: (width as f64 / total_cols as f64).min(1.0),
+            window_start: 0.0,
+            width,
+        },
+        ZoomMode::Scale(s) => {
+            let scale = s.max(1e-6);
+            let visible_cols = width as f64 / scale;
+            let center = selected_visual_col.unwrap_or(0) as f64;
+            let max_start = (total_cols as f64 - visible_cols).max(0.0);
+            let window_start = (center - visible_cols / 2.0).clamp(0.0, max_start);
+            HorizontalViewport { scale, window_start, width }
+        }
     }
 }
 
@@ -2391,6 +2524,102 @@ mod tests {
         let col0 = app.kernel_diff_column[t0_gemm].unwrap().column;
         let col1 = app.kernel_diff_column[t1_gemm].unwrap().column;
         assert_eq!(col0, col1, "matched kernels share column");
+    }
+
+    // G1: idle between consecutive T0 kernels -> proportional lead_gap_cols on the
+    // slot starting the following kernel. Larger idle => more lead columns.
+    #[test]
+    fn compute_idle_gap_cols() {
+        // T0: A@0-10, B@100-110 (idle 90), C@120-130 (idle 10). T1 matches names.
+        let t0 = trace_of(
+            vec![kd(1, 0.0, "A", 10.0), kd(1, 100.0, "B", 10.0), kd(1, 120.0, "C", 10.0)],
+            vec![],
+        );
+        let t1 = trace_of(
+            vec![kd(1, 0.0, "A", 10.0), kd(1, 100.0, "B", 10.0), kd(1, 120.0, "C", 10.0)],
+            vec![],
+        );
+        let app = App::new_multi(vec![("T0".into(), t0), ("T1".into(), t1)]);
+        let slots = &app.diff_columns_by_stream[&1].slots;
+        // 3 matched slots for A, B, C in order.
+        let gap_b = slots[1].lead_gap_cols;
+        let gap_c = slots[2].lead_gap_cols;
+        assert!(gap_b > 0, "large idle before B must produce a gap, got {gap_b}");
+        assert!(gap_b > gap_c, "idle before B (90) > before C (10): {gap_b} vs {gap_c}");
+        assert!(gap_b <= 8, "lead_gap_cols must be clamped to <=8, got {gap_b}");
+    }
+
+    // Shared visual layer: stream_layout expands each slot's lead_gap_cols into
+    // Gap columns before the Slot, giving one coordinate system for kernels+annotations.
+    #[test]
+    fn stream_layout_expands_gaps() {
+        let t0 = trace_of(
+            vec![kd(1, 0.0, "A", 10.0), kd(1, 100.0, "B", 10.0)],
+            vec![],
+        );
+        let t1 = trace_of(
+            vec![kd(1, 0.0, "A", 10.0), kd(1, 100.0, "B", 10.0)],
+            vec![],
+        );
+        let app = App::new_multi(vec![("T0".into(), t0), ("T1".into(), t1)]);
+        let layout = app.stream_layout(1).expect("layout for stream 1");
+        // Slot 0 (A) has no lead gap; slot 1 (B) has lead_gap_cols > 0 before it.
+        let gap_b = app.diff_columns_by_stream[&1].slots[1].lead_gap_cols as usize;
+        assert!(gap_b > 0, "B must have a lead gap");
+        // Visual columns: Slot(0), then gap_b Gaps, then Slot(1).
+        assert_eq!(layout.columns[0], VisualColumn::Slot(0));
+        for g in 1..=gap_b {
+            assert_eq!(layout.columns[g], VisualColumn::Gap, "col {g} must be Gap");
+        }
+        assert_eq!(layout.columns[gap_b + 1], VisualColumn::Slot(1));
+        assert_eq!(layout.slot_to_visual_col[0], 0);
+        assert_eq!(layout.slot_to_visual_col[1], gap_b + 1);
+        assert_eq!(layout.total_cols, layout.columns.len());
+    }
+
+    // Z: resolve_viewport maps zoom to a horizontal scale. Fit compresses all
+    // visual columns into width (scale<=1, window_start 0); Scale centers on selection.
+    #[test]
+    fn resolve_viewport_fit_and_scale() {
+        // Fit with more columns than width -> scale = width/total, from column 0.
+        let vp = resolve_viewport(ZoomMode::Fit, 1000, 100, Some(500));
+        assert!((vp.scale - 0.1).abs() < 1e-9, "fit scale = 100/1000, got {}", vp.scale);
+        assert_eq!(vp.window_start, 0.0, "fit anchors at 0");
+        assert_eq!(vp.width, 100);
+
+        // Scale(4.0): 4 cells per column, window centered on selected col, clamped.
+        let vp = resolve_viewport(ZoomMode::Scale(4.0), 1000, 100, Some(500));
+        assert!(vp.scale >= 1.0, "scale >= 1 stays 1+");
+        let visible = 100.0 / vp.scale;
+        assert!(vp.window_start >= 0.0 && vp.window_start <= 1000.0 - visible, "clamped: {}", vp.window_start);
+        // Centered near 500.
+        assert!((vp.window_start + visible / 2.0 - 500.0).abs() <= visible, "centered on selection");
+    }
+
+    // A1: annotation_visual_span maps an annotation's covered kernels (by ts span)
+    // to the visual-column range of those kernels, so its end aligns to a kernel.
+    #[test]
+    fn annotation_visual_span_maps_column_range() {
+        // T0 kernels A@0, B@100, C@200 (all matched); annotation covers [50,250] -> B,C.
+        let mut a0 = ann(1, 50.0, "region");
+        a0.dur = 200.0; // covers ts 50..250 -> B(100) and C(200)
+        let t0 = trace_of(
+            vec![kd(1, 0.0, "A", 10.0), kd(1, 100.0, "B", 10.0), kd(1, 200.0, "C", 10.0)],
+            vec![a0],
+        );
+        let t1 = trace_of(
+            vec![kd(1, 0.0, "A", 10.0), kd(1, 100.0, "B", 10.0), kd(1, 200.0, "C", 10.0)],
+            vec![],
+        );
+        let app = App::new_multi(vec![("T0".into(), t0), ("T1".into(), t1)]);
+        let layout = app.stream_layout(1).unwrap();
+        let ann_idx = app.annotations.iter().position(|a| a.name == "region").unwrap();
+        let (lo, hi) = app.annotation_visual_span(ann_idx, &layout).expect("span");
+        // B is slot 1, C is slot 2; their visual cols.
+        let col_b = layout.slot_to_visual_col[1];
+        let col_c = layout.slot_to_visual_col[2];
+        assert_eq!(lo, col_b, "span start at B's visual col");
+        assert_eq!(hi, col_c, "span end at C's visual col (annotation end aligns to C)");
     }
 
     // T6: new_multi automatically runs compute_diff (no manual call needed)
