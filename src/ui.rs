@@ -418,110 +418,139 @@ fn build_lane_columns(app: &App, lane_idx: usize, width: usize) -> Vec<Span<'sta
             return build_lane(app, lane_idx, 0.0, 1.0, width);
         }
     };
-    let Some(columns) = app.diff_columns_by_stream.get(&stream_id) else {
+    let Some(layout) = app.stream_layout(stream_id) else {
         return build_lane(app, lane_idx, 0.0, 1.0, width);
     };
-    debug_assert_eq!(columns.stream_id, stream_id, "slot table keyed by its own stream");
-    let slots = &columns.slots;
-    let n_slots = slots.len();
-    if width == 0 || n_slots == 0 {
+    let slots = &app.diff_columns_by_stream[&stream_id].slots;
+    if width == 0 || layout.total_cols == 0 {
         return vec![Span::styled(" ".repeat(width), Style::new().bg(Color::Black))];
     }
 
-    let slot_width = (app.zoom_level.round() as usize).max(1);
-    let visible_slots = width.div_ceil(slot_width);
-    let window_start = column_window_start(app, lane_idx, n_slots, visible_slots);
+    let selected_visual_col = selected_visual_col_for_stream(app, &layout, stream_id);
+    let vp = crate::app::resolve_viewport(app.zoom_mode, layout.total_cols, width, selected_visual_col);
 
     let is_active_lane = lane_idx == app.active_lane;
-    let mut spans: Vec<Span<'static>> = Vec::new();
-    let mut cursor = 0usize;
+    let selected_kernel = if is_active_lane {
+        lane.item_indices().get(app.selected_item).copied()
+    } else {
+        None
+    };
 
-    for offset in 0..visible_slots {
-        let slot_idx = window_start + offset;
-        if slot_idx >= n_slots {
-            break;
-        }
-        let x = offset * slot_width;
-        if x >= width {
-            break;
-        }
-        let draw_width = slot_width.min(width - x);
-        let slot = slots[slot_idx];
-        let kernel_idx = if trace_id == 0 { slot.t0_kernel } else { slot.t1_kernel };
+    let mut spans: Vec<Span<'static>> = Vec::with_capacity(width);
+    for x in 0..width {
+        let a = vp.window_start + x as f64 / vp.scale;
+        let b = vp.window_start + (x + 1) as f64 / vp.scale;
+        let start = (a.floor().max(0.0) as usize).min(layout.total_cols);
+        let end = (b.ceil() as usize).clamp(start, layout.total_cols);
+        let cols = if start < end {
+            &layout.columns[start..end]
+        } else {
+            &[][..]
+        };
 
-        match kernel_idx {
-            Some(idx) => {
-                let base = kernel_color(app.kernels[idx].cat.as_str(), slot_idx);
-                let bg = app.kernel_diff_color(idx).unwrap_or(base);
-                let is_selected = is_active_lane
-                    && lane.item_indices().get(app.selected_item) == Some(&idx);
-                let name = app.kernels[idx].name.as_str();
-                let label = pad_to(ellipsize(name, draw_width), draw_width);
-                let style = if is_selected {
-                    Style::new().fg(Color::Black).bg(Color::White)
-                } else {
-                    Style::new().fg(Color::Black).bg(bg)
-                };
-                spans.push(Span::styled(label, style));
-            }
-            None => {
-                spans.push(Span::styled(
-                    " ".repeat(draw_width),
-                    Style::new().bg(Color::Black),
-                ));
-            }
-        }
-        cursor = x + draw_width;
+        // Single-slot cell that holds the selected kernel: highlight it.
+        let selected_here = selected_kernel.is_some_and(|sk| {
+            cols.iter().any(|c| matches!(c, crate::app::VisualColumn::Slot(i)
+                if slot_kernel(slots, *i, trace_id) == Some(sk)))
+        });
+
+        let (label, style) = if selected_here {
+            (label_for_cell(app, cols, slots, trace_id), Style::new().fg(Color::Black).bg(Color::White))
+        } else {
+            let color = aggregate_kernel_cell_color(app, cols, slots, trace_id);
+            (label_for_cell(app, cols, slots, trace_id), Style::new().fg(Color::Black).bg(color))
+        };
+        spans.push(Span::styled(label, style));
     }
-
-    if cursor < width {
-        spans.push(Span::styled(
-            " ".repeat(width - cursor),
-            Style::new().bg(Color::Black),
-        ));
-    }
-
     spans
 }
 
-// First visible slot: center the window on the selected kernel's column for the
-// active lane's stream; other lanes track proportional progress so streams pan
-// together without a shared time axis.
-fn column_window_start(
-    app: &App,
-    lane_idx: usize,
-    n_slots: usize,
-    visible_slots: usize,
-) -> usize {
-    if visible_slots >= n_slots {
-        return 0;
-    }
-    let max_start = n_slots - visible_slots;
-    let lane = &app.lanes[lane_idx];
+fn slot_kernel(slots: &[crate::app::DiffColumnSlot], slot_idx: usize, trace_id: usize) -> Option<usize> {
+    let slot = slots.get(slot_idx)?;
+    if trace_id == 0 { slot.t0_kernel } else { slot.t1_kernel }
+}
 
-    let center_col = app
+// One label char for a cell: the first covered kernel's initial, else space.
+fn label_for_cell(
+    app: &App,
+    cols: &[crate::app::VisualColumn],
+    slots: &[crate::app::DiffColumnSlot],
+    trace_id: usize,
+) -> String {
+    for c in cols {
+        if let crate::app::VisualColumn::Slot(i) = c {
+            if let Some(idx) = slot_kernel(slots, *i, trace_id) {
+                let name = app.kernels[idx].name.as_str();
+                return ellipsize(name, 1);
+            }
+        }
+    }
+    " ".to_string()
+}
+
+// Per-lane color for a compressed cell covering a range of visual columns.
+// Diff priority (Removed>Added) preserves S1/S2 opposite-lane gaps under fit.
+fn aggregate_kernel_cell_color(
+    app: &App,
+    cols: &[crate::app::VisualColumn],
+    slots: &[crate::app::DiffColumnSlot],
+    trace_id: usize,
+) -> Color {
+    let mut has_removed = false;
+    let mut has_added = false;
+    let mut matched_slot: Option<usize> = None;
+    for c in cols {
+        let crate::app::VisualColumn::Slot(i) = c else { continue };
+        let slot = &slots[*i];
+        match (trace_id, slot.t0_kernel, slot.t1_kernel) {
+            (0, Some(_), None) => has_removed = true,
+            (1, None, Some(_)) => has_added = true,
+            (_, Some(_), Some(_)) if matched_slot.is_none() => {
+                matched_slot = Some(*i);
+            }
+            _ => {}
+        }
+    }
+    if has_removed {
+        Color::Rgb(220, 38, 38)
+    } else if has_added {
+        Color::Rgb(34, 197, 94)
+    } else if let Some(i) = matched_slot {
+        if let Some(idx) = slot_kernel(slots, i, trace_id) {
+            kernel_color(app.kernels[idx].cat.as_str(), i)
+        } else {
+            Color::Black
+        }
+    } else {
+        Color::Black
+    }
+}
+
+// Visual column of the selected kernel within `stream_id`'s layout, for panning.
+// Same-stream lanes center on the exact column; other streams pan proportionally.
+fn selected_visual_col_for_stream(
+    app: &App,
+    layout: &crate::app::StreamLayout,
+    stream_id: u64,
+) -> Option<usize> {
+    let active = app
         .lanes
         .get(app.active_lane)
-        .filter(|active| matches!(active, crate::app::Lane::Kernels { .. }))
-        .and_then(|active| {
-            let sel_idx = *active.item_indices().get(app.selected_item)?;
-            let kc = app.kernel_diff_column.get(sel_idx).copied().flatten()?;
-            if active.stream_id() == lane.stream_id() {
-                Some(kc.column)
-            } else {
-                let active_slots = app
-                    .diff_columns_by_stream
-                    .get(&active.stream_id())
-                    .map(|c| c.slots.len())
-                    .unwrap_or(1)
-                    .max(1);
-                let frac = kc.column as f64 / active_slots as f64;
-                Some((frac * n_slots as f64) as usize)
-            }
-        })
-        .unwrap_or(0);
-
-    center_col.saturating_sub(visible_slots / 2).min(max_start)
+        .filter(|l| matches!(l, crate::app::Lane::Kernels { .. }))?;
+    let sel_idx = *active.item_indices().get(app.selected_item)?;
+    let kc = app.kernel_diff_column.get(sel_idx).copied().flatten()?;
+    if kc.stream_id == stream_id {
+        layout.slot_to_visual_col.get(kc.column).copied()
+    } else {
+        let active_slots = app
+            .diff_columns_by_stream
+            .get(&kc.stream_id)
+            .map(|c| c.slots.len())
+            .unwrap_or(1)
+            .max(1);
+        let frac = kc.column as f64 / active_slots as f64;
+        Some(((frac * layout.total_cols as f64) as usize).min(layout.total_cols.saturating_sub(1)))
+    }
 }
 
 fn render_info_panel(frame: &mut Frame, area: Rect, app: &App) {

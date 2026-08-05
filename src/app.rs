@@ -17,6 +17,7 @@ pub struct DiffColumnSlot {
 
 #[derive(Debug, Clone)]
 pub struct DiffStreamColumns {
+    #[allow(dead_code)] // consumed by annotation column rendering (W5)
     pub stream_id: u64,
     pub slots: Vec<DiffColumnSlot>,
 }
@@ -35,6 +36,7 @@ pub enum VisualColumn {
 
 #[derive(Debug, Clone)]
 pub struct StreamLayout {
+    #[allow(dead_code)] // consumed by annotation column rendering (W5)
     pub stream_id: u64,
     pub columns: Vec<VisualColumn>,
     pub slot_to_visual_col: Vec<usize>,
@@ -419,6 +421,7 @@ impl App {
     // Visual-column [start,end] an annotation should span: the columns of the
     // kernels (same trace+stream) whose start ts falls within the annotation's
     // time span. Empty coverage falls back to the nearest kernel (1-col block).
+    #[allow(dead_code)] // consumed by annotation column rendering (W5)
     pub fn annotation_visual_span(
         &self,
         ann_idx: usize,
@@ -1250,7 +1253,7 @@ fn median_of(durs: &[f64]) -> f64 {
 // Horizontal viewport for column rendering. Fit compresses every visual column
 // into `width` cells (scale may be < 1, many columns per cell); Scale keeps
 // `scale` cells per column and centers the window on the selected column.
-fn resolve_viewport(
+pub fn resolve_viewport(
     mode: ZoomMode,
     total_cols: usize,
     width: usize,
@@ -2822,6 +2825,63 @@ mod tests {
             prev_colored = colored;
         }
         starts
+    }
+
+    // Build a 2-trace app with `n` matched kernels per trace (more than lane width).
+    fn make_many_kernel_app(n: usize) -> App {
+        let names: Vec<String> = (0..n).map(|i| format!("k{i}")).collect();
+        let refs: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
+        make_two_trace_app(&refs, &refs)
+    }
+
+    // Z1: in Fit mode every slot is represented within the lane width (window at 0,
+    // no clipping off the right edge).
+    #[test]
+    fn surface_fit_shows_all() {
+        let mut app = make_many_kernel_app(300);
+        app.zoom_fit();
+        let layout = app.stream_layout(1).unwrap();
+        assert!(layout.total_cols > 118, "test needs more cols than width");
+        let buf = render_buffer(&app);
+        let (yr, _yg) = kernel_lane_rows(&buf);
+        // Fit compresses everything: colored cells reach near the right edge of the lane.
+        let rightmost = (0..120u16).rev().find(|&x| bg_at(&buf, x, yr).is_some());
+        assert!(rightmost.unwrap_or(0) > 100, "fit must fill lane width, got {rightmost:?}");
+    }
+
+    // Z1: a removed/added kernel merged into a compressed cell still shows its diff color.
+    #[test]
+    fn surface_fit_preserves_diff_color() {
+        use ratatui::style::Color;
+        // 200 matched + one removed (T0 only) + one added (T1 only).
+        let mut t0n: Vec<String> = (0..200).map(|i| format!("k{i}")).collect();
+        let mut t1n = t0n.clone();
+        t0n.push("REMOVED_ONLY".to_string());
+        t1n.push("ADDED_ONLY".to_string());
+        let r0: Vec<&str> = t0n.iter().map(|s| s.as_str()).collect();
+        let r1: Vec<&str> = t1n.iter().map(|s| s.as_str()).collect();
+        let mut app = make_two_trace_app(&r0, &r1);
+        app.zoom_fit();
+        let buf = render_buffer(&app);
+        let (yr, yg) = kernel_lane_rows(&buf);
+        let has_red = (0..120u16).any(|x| bg_at(&buf, x, yr) == Some(Color::Rgb(220, 38, 38)));
+        let has_green = (0..120u16).any(|x| bg_at(&buf, x, yg) == Some(Color::Rgb(34, 197, 94)));
+        assert!(has_red, "removed kernel must stay red even when merged in fit mode");
+        assert!(has_green, "added kernel must stay green even when merged in fit mode");
+    }
+
+    // Z2: zooming in gives each slot >=1 cell so individual kernels are distinct.
+    #[test]
+    fn surface_zoom_in_separates() {
+        let mut app = make_two_trace_app(&["A", "B", "C"], &["A", "B", "C"]);
+        for _ in 0..6 {
+            app.zoom_in();
+        }
+        let buf = render_buffer(&app);
+        let (yr, _yg) = kernel_lane_rows(&buf);
+        // At high zoom, the 3 kernels occupy wide, distinct blocks.
+        let colored = (0..120u16).filter(|&x| bg_at(&buf, x, yr).is_some()).count();
+        assert!(colored >= 3, "zoomed-in kernels must render distinct cells, got {colored}");
     }
 
     // S1 (gap): removed B is red in T0 lane; SAME column is a black gap in T1 lane.
