@@ -335,11 +335,13 @@ fn build_lane(
         let (name, ts, end_ts, block_bg) = match lane {
             crate::app::Lane::Kernels { .. } => {
                 let k = &app.kernels[item_idx];
+                let base = kernel_color(k.cat.as_str(), pos);
+                let bg = app.kernel_diff_color(item_idx).unwrap_or(base);
                 (
                     k.name.as_str(),
                     app.kernel_render_ts(item_idx),
                     app.kernel_render_end(item_idx),
-                    kernel_color(k.cat.as_str(), pos),
+                    bg,
                 )
             }
             crate::app::Lane::Annotations { .. } => {
