@@ -23,13 +23,20 @@ chmod +x pytorch-trace-tui-x86_64-unknown-linux-gnu
 ./pytorch-trace-tui-x86_64-unknown-linux-gnu
 ```
 
-Or build and install from traces
+Or build and install from source
 
 ```bash
 git clone https://github.com/mpashkovskiy/pytorch-trace-tui.git
+rustup target add x86_64-unknown-linux-musl   # once
 cargo build --release
 cargo install --path .
 ```
+
+The project defaults to the statically-linked `x86_64-unknown-linux-musl`
+target (see [`.cargo/config.toml`](.cargo/config.toml)), so the resulting binary
+bundles libc and runs on any Linux regardless of the host glibc version. This
+avoids errors like `version `GLIBC_2.39' not found` that occur when a
+glibc-linked binary built on a newer machine is run on an older one.
 
 ## Usage
 
