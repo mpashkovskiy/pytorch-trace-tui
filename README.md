@@ -17,7 +17,7 @@ in seconds.
 Download the latest release and run:
 
 ```bash
-wget https://github.com/mpashkovskiy/pytorch-trace-tui/releases/latest/download/pytorch-trace-tui-x86_64-unknown-linux-musl
+wget https://github.com/mpashkovskiy/pytorch-trace-tui/releases/download/latest/pytorch-trace-tui-x86_64-unknown-linux-musl
 chmod +x pytorch-trace-tui-x86_64-unknown-linux-musl
 # make sure you run from folder with traces
 ./pytorch-trace-tui-x86_64-unknown-linux-musl
