@@ -1,11 +1,12 @@
-# Default to a statically-linked musl target so the resulting binary bundles
-# libc and runs on any Linux regardless of the host glibc version.
-#
-# This avoids errors like:
+# Default local builds to a statically-linked musl target so the resulting
+# binary bundles libc and runs on any Linux regardless of the host glibc
+# version. This avoids errors like:
 #   version `GLIBC_2.39' not found (required by pytorch-trace-tui)
 # which happen when a glibc-linked binary built on a newer machine is run on an
 # older one (glibc is backward-, not forward-compatible).
 #
 # Requires the target once:  rustup target add x86_64-unknown-linux-musl
+# CI is unaffected: the release workflow installs musl-tools + the target and
+# passes an explicit --target, so it does not depend on this default.
 [build]
 target = "x86_64-unknown-linux-musl"

@@ -24,21 +24,26 @@ jobs:
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
 
       - name: Install clipboard system deps
         run: |
           sudo apt-get update
-          sudo apt-get install -y libxcb1-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev
+          sudo apt-get install -y libxcb1-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev musl-tools
 
+      # Build a statically-linked musl binary so the release asset bundles libc
+      # and runs on any Linux regardless of the host glibc version (avoids
+      # "version `GLIBC_2.xx' not found" at runtime on older distros).
       - name: Build release binary
-        run: cargo build --release --locked
+        run: cargo build --release --locked --target x86_64-unknown-linux-musl
 
       - name: Rename binary with target triple
         shell: bash
         run: |
           BIN=pytorch-trace-tui
-          ASSET="${BIN}-x86_64-unknown-linux-gnu"
-          cp "target/release/${BIN}" "$ASSET"
+          ASSET="${BIN}-x86_64-unknown-linux-musl"
+          cp "target/x86_64-unknown-linux-musl/release/${BIN}" "$ASSET"
           chmod +x "$ASSET"
           echo "ASSET=${ASSET}" >> "$GITHUB_ENV"
 

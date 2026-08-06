@@ -14,14 +14,18 @@ in seconds.
 
 ## Install
 
-Select the version from GitHub releases, replace v0.2.0 below with any version you need and run:
+Download the latest release and run:
 
 ```bash
-wget https://github.com/mpashkovskiy/pytorch-trace-tui/releases/download/v0.2.0/pytorch-trace-tui-x86_64-unknown-linux-gnu
-chmod +x pytorch-trace-tui-x86_64-unknown-linux-gnu
+wget https://github.com/mpashkovskiy/pytorch-trace-tui/releases/latest/download/pytorch-trace-tui-x86_64-unknown-linux-musl
+chmod +x pytorch-trace-tui-x86_64-unknown-linux-musl
 # make sure you run from folder with traces
-./pytorch-trace-tui-x86_64-unknown-linux-gnu
+./pytorch-trace-tui-x86_64-unknown-linux-musl
 ```
+
+The released binary is statically linked against musl, so it bundles libc and
+runs on any Linux regardless of the host glibc version — no more
+`version `GLIBC_2.39' not found` on older distros.
 
 Or build and install from source
 
@@ -32,11 +36,9 @@ cargo build --release
 cargo install --path .
 ```
 
-The project defaults to the statically-linked `x86_64-unknown-linux-musl`
-target (see [`.cargo/config.toml`](.cargo/config.toml)), so the resulting binary
-bundles libc and runs on any Linux regardless of the host glibc version. This
-avoids errors like `version `GLIBC_2.39' not found` that occur when a
-glibc-linked binary built on a newer machine is run on an older one.
+Local builds default to the statically-linked `x86_64-unknown-linux-musl` target
+(via `.cargo/config.toml`), so the binary you build bundles libc and is just as
+portable as the released one.
 
 ## Usage
 
