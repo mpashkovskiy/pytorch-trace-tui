@@ -21,7 +21,10 @@ const KERNEL_COLORS: &[Color] = &[
 const MEMCPY_COLOR: Color = Color::Rgb(139, 92, 246);
 const MEMSET_COLOR: Color = Color::Rgb(251, 191, 36);
 
-pub fn render(frame: &mut Frame, app: &App) {
+const DIFF_ADDED: Color = Color::Rgb(34, 197, 94);
+const DIFF_DELETED: Color = Color::Rgb(220, 38, 38);
+
+pub fn render(frame: &mut Frame, app: &mut App) {
     let area = frame.area();
 
     let chunks = Layout::default()
@@ -189,10 +192,24 @@ fn render_header(frame: &mut Frame, area: Rect, app: &App) {
         Span::styled("Zoom: ", Style::new().fg(Color::DarkGray)),
         Span::styled(app.zoom_label(), Style::new().fg(Color::Magenta).bold()),
         Span::styled(
-            "  [/] search  [Tab/S-Tab] lane  [A/D] item  [W/S] zoom  [G] align  [Q] quit",
+            if app.traces.len() == 2 {
+                "  [/] search  [Tab] lane  [A/D] item  [W/S] zoom  [E] export  [G] diff/normal  [Q] quit"
+            } else {
+                "  [/] search  [Tab] lane  [A/D] item  [W/S] zoom  [E] export  [Q] quit"
+            },
             Style::new().fg(Color::DarkGray),
         ),
     ]);
+
+    if let Some(status) = app.status.as_deref() {
+        let line = Line::from(vec![
+            Span::styled(" GPU Trace Viewer ", Style::new().fg(Color::Black).bg(Color::Cyan).bold()),
+            Span::raw("  "),
+            Span::styled(status.to_string(), Style::new().fg(Color::Black).bg(Color::Green).bold()),
+        ]);
+        frame.render_widget(Paragraph::new(line).style(Style::new().bg(Color::Black)), area);
+        return;
+    }
 
     if app.search_active {
         let prompt_style = if app.search_no_match {
@@ -200,13 +217,18 @@ fn render_header(frame: &mut Frame, area: Rect, app: &App) {
         } else {
             Style::new().fg(Color::Black).bg(Color::Yellow).bold()
         };
+        let status = if app.search_no_match {
+            "  (no match)".to_string()
+        } else {
+            match app.search_match_label() {
+                Some(pos) => format!("  {}  [Enter/S-Enter] next/prev  [Esc] cancel", pos),
+                None => "  [Enter] keep  [Esc] cancel".to_string(),
+            }
+        };
         let line = Line::from(vec![
             Span::styled(" /search: ", Style::new().fg(Color::Black).bg(Color::Yellow).bold()),
             Span::styled(format!("{}\u{2588}", app.search_query), prompt_style),
-            Span::styled(
-                if app.search_no_match { "  (no match)" } else { "  [Enter] keep  [Esc] cancel" },
-                Style::new().fg(Color::DarkGray),
-            ),
+            Span::styled(status, Style::new().fg(Color::DarkGray)),
         ]);
         frame.render_widget(Paragraph::new(line).style(Style::new().bg(Color::Black)), area);
         return;
@@ -215,13 +237,10 @@ fn render_header(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(Paragraph::new(line).style(Style::new().bg(Color::Black)), area);
 }
 
-fn render_lane(frame: &mut Frame, area: Rect, app: &App) {
-    let title = match app.alignment_label() {
-        Some(status) => format!(
-            " {} traces — {} ",
-            app.traces.len(),
-            status
-        ),
+fn render_lane(frame: &mut Frame, area: Rect, app: &mut App) {
+    let title = match app.mode_label() {
+        Some(mode) => format!(" {} traces — {} ", app.traces.len(), mode),
+        None if app.traces.len() > 1 => format!(" {} traces ", app.traces.len()),
         None => format!(
             " GPU Streams ({}) — active cuda:{} ",
             app.streams.len(),
@@ -241,6 +260,7 @@ fn render_lane(frame: &mut Frame, area: Rect, app: &App) {
     let total_width = inner.width as usize;
     let label_width = stream_label_width(app);
     if total_width <= label_width + 4 {
+        app.lane_layout = crate::app::LaneLayout::default();
         return;
     }
     let lane_width = total_width - label_width;
@@ -248,11 +268,22 @@ fn render_lane(frame: &mut Frame, area: Rect, app: &App) {
     let (ts_start, ts_end) = app.global_visible_window();
     let time_span = (ts_end - ts_start).max(1.0);
 
-    let mut lines: Vec<Line> = Vec::new();
-
     let visible_rows = inner.height as usize;
     let start = app.lane_view_offset.min(app.lanes.len().saturating_sub(1));
     let end = (start + visible_rows).min(app.lanes.len());
+
+    app.lane_layout = crate::app::LaneLayout {
+        inner_x: inner.x,
+        inner_y: inner.y,
+        inner_h: inner.height,
+        label_width: label_width as u16,
+        lane_width: lane_width as u16,
+        view_offset: start,
+        ts_start,
+        time_span,
+    };
+
+    let mut lines: Vec<Line> = Vec::new();
 
     let multi = app.traces.len() > 1;
     let short_labels = app.trace_display_labels();
@@ -316,7 +347,96 @@ fn stream_label_width(app: &App) -> usize {
     max + 2
 }
 
-fn build_lane(
+pub(crate) fn build_lane(
+    app: &App,
+    lane_idx: usize,
+    ts_start: f64,
+    time_span: f64,
+    width: usize,
+) -> Vec<Span<'static>> {
+    let lane = &app.lanes[lane_idx];
+    if lane.is_annotations() {
+        return build_annotation_lane(app, lane_idx, ts_start, time_span, width);
+    }
+
+    let ts_end = ts_start + time_span;
+    let diff_active =
+        app.traces.len() == 2 && app.align_mode == crate::app::AlignMode::Diff;
+    let classes = app.lane_column_classes(lane_idx, ts_start, time_span, width, diff_active);
+
+    // Per-column colour, authoritative: the priority-resolved class governs the
+    // cell colour, so a wide matched (dimmed) block can never overwrite a
+    // narrower added/deleted column.
+    let mut fg = vec![Color::White; width];
+    let mut bg = vec![Color::Black; width];
+    for (col, cell) in classes.iter().enumerate() {
+        let Some((class, owner_pos)) = *cell else {
+            continue;
+        };
+        let base = lane
+            .item_indices()
+            .get(owner_pos)
+            .map(|&i| kernel_color(app.kernels[i].cat.as_str(), owner_pos))
+            .unwrap_or(Color::Black);
+        let (f, b) = match class {
+            crate::app::ColumnClass::Selected => (Color::Black, Color::White),
+            crate::app::ColumnClass::Added => (Color::Black, DIFF_ADDED),
+            crate::app::ColumnClass::Deleted => (Color::White, DIFF_DELETED),
+            crate::app::ColumnClass::Matched if diff_active => {
+                (Color::Rgb(140, 140, 140), dim_color(base))
+            }
+            crate::app::ColumnClass::Matched => (Color::Black, base),
+        };
+        fg[col] = f;
+        bg[col] = b;
+    }
+
+    // Per-column label characters, drawn over each block's own column run. Later
+    // blocks may overwrite earlier label chars in an overlap — cosmetic only; the
+    // colour buffer above stays priority-correct.
+    let mut chars = vec![' '; width];
+    for &item_idx in lane.item_indices().iter() {
+        let ts = app.kernel_render_ts(item_idx);
+        let end_ts = app.kernel_render_end(item_idx);
+        let Some((start_col, end_col)) =
+            crate::app::kernel_columns(ts, end_ts, ts_start, ts_end, width)
+        else {
+            continue;
+        };
+        let block_width = end_col.saturating_sub(start_col).max(1);
+        let label = pad_to(ellipsize(&app.kernels[item_idx].name, block_width), block_width);
+        for (offset, ch) in label.chars().enumerate() {
+            let col = start_col + offset;
+            if col < end_col && col < width {
+                chars[col] = ch;
+            }
+        }
+    }
+
+    coalesce_columns(&fg, &bg, &chars)
+}
+
+/// Merges per-column (fg, bg, char) cells into styled spans, one span per run of
+/// identical style.
+fn coalesce_columns(fg: &[Color], bg: &[Color], chars: &[char]) -> Vec<Span<'static>> {
+    let width = fg.len();
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut col = 0;
+    while col < width {
+        let (f, b) = (fg[col], bg[col]);
+        let mut run = String::new();
+        while col < width && fg[col] == f && bg[col] == b {
+            run.push(chars[col]);
+            col += 1;
+        }
+        spans.push(Span::styled(run, Style::new().fg(f).bg(b)));
+    }
+    spans
+}
+
+/// Annotation lanes render with a single background and no diff colouring; this
+/// preserves the original block-based drawing for them.
+fn build_annotation_lane(
     app: &App,
     lane_idx: usize,
     ts_start: f64,
@@ -332,27 +452,9 @@ fn build_lane(
     let ann_bg = Color::Rgb(90, 90, 110);
 
     for (pos, &item_idx) in lane.item_indices().iter().enumerate() {
-        let (name, ts, end_ts, block_bg) = match lane {
-            crate::app::Lane::Kernels { .. } => {
-                let k = &app.kernels[item_idx];
-                (
-                    k.name.as_str(),
-                    app.kernel_render_ts(item_idx),
-                    app.kernel_render_end(item_idx),
-                    kernel_color(k.cat.as_str(), pos),
-                )
-            }
-            crate::app::Lane::Annotations { .. } => {
-                let a = &app.annotations[item_idx];
-                (
-                    a.name.as_str(),
-                    app.annotation_render_ts(item_idx),
-                    app.annotation_render_end(item_idx),
-                    ann_bg,
-                )
-            }
-        };
-
+        let name = app.annotations[item_idx].name.as_str();
+        let ts = app.annotation_render_ts(item_idx);
+        let end_ts = app.annotation_render_end(item_idx);
         let is_selected = is_active_lane && pos == app.selected_item;
 
         let Some((start_col, end_col)) =
@@ -361,8 +463,6 @@ fn build_lane(
             continue;
         };
 
-        // Clamp to cursor so sub-column items don't each steal a full column and
-        // push later items off the lane.
         let start_col = start_col.max(cursor);
         if start_col >= end_col || start_col >= width {
             continue;
@@ -377,15 +477,11 @@ fn build_lane(
 
         let block_width = end_col.saturating_sub(start_col).max(1);
         let label = pad_to(ellipsize(name, block_width), block_width);
-
         let style = if is_selected {
             Style::new().fg(Color::Black).bg(Color::White)
-        } else if lane.is_annotations() {
-            Style::new().fg(Color::White).bg(block_bg)
         } else {
-            Style::new().fg(Color::Black).bg(block_bg)
+            Style::new().fg(Color::White).bg(ann_bg)
         };
-
         spans.push(Span::styled(label, style));
         cursor = end_col;
     }
@@ -493,6 +589,15 @@ fn kernel_color(cat: &str, idx: usize) -> Color {
     }
 }
 
+/// Darkens a block colour toward black so matched (unchanged) kernels recede and
+/// the green/red added/deleted blocks stand out in diff mode.
+fn dim_color(c: Color) -> Color {
+    match c {
+        Color::Rgb(r, g, b) => Color::Rgb(r / 3, g / 3, b / 3),
+        other => other,
+    }
+}
+
 fn ellipsize(s: &str, max_chars: usize) -> String {
     if max_chars == 0 {
         return String::new();
@@ -527,4 +632,93 @@ fn kv_label(s: &str) -> Span<'static> {
 
 fn kv_value(s: &str) -> Span<'static> {
     Span::styled(s.to_string(), Style::new().fg(Color::White).bold())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::app::App;
+    use crate::trace::{AnnotationEvent, KernelEvent, Trace};
+
+    fn k(stream: u64, ts: f64, name: &str, dur: f64) -> KernelEvent {
+        KernelEvent {
+            name: name.into(),
+            cat: "kernel".into(),
+            ts,
+            dur,
+            device: 0,
+            stream,
+            grid: None,
+            block: None,
+            shared_memory: None,
+            registers_per_thread: None,
+            correlation: None,
+            trace_id: 0,
+        }
+    }
+
+    fn ann(stream: u64, ts: f64, dur: f64, name: &str) -> AnnotationEvent {
+        AnnotationEvent {
+            name: name.into(),
+            ts,
+            dur,
+            stream,
+            trace_id: 0,
+        }
+    }
+
+    fn bgs(spans: &[Span<'static>]) -> Vec<Color> {
+        spans.iter().filter_map(|s| s.style.bg).collect()
+    }
+
+    // S8: an annotation lane renders with ann_bg and never the diff colours.
+    #[test]
+    fn test_annotation_lane_uses_ann_bg_never_diff_colors() {
+        let t0 = Trace {
+            kernels: vec![k(1, 100.0, "x", 10.0)],
+            annotations: vec![ann(1, 100.0, 40.0, "ctx")],
+        };
+        let t1 = Trace {
+            kernels: vec![k(1, 100.0, "x", 10.0)],
+            annotations: vec![ann(1, 100.0, 40.0, "ctx")],
+        };
+        let app = App::new_multi(vec![("A".into(), t0), ("B".into(), t1)]);
+        let ann_lane = app.lanes.iter().position(|l| l.is_annotations()).unwrap();
+        let spans = build_lane(&app, ann_lane, 100.0, 40.0, 40);
+        let colors = bgs(&spans);
+        let ann_bg = Color::Rgb(90, 90, 110);
+        assert!(colors.contains(&ann_bg), "annotation lane uses ann_bg");
+        assert!(
+            !colors.contains(&DIFF_ADDED) && !colors.contains(&DIFF_DELETED),
+            "annotation lane never uses diff colours"
+        );
+    }
+
+    // The fix at the UI layer: a wide MATCHED (dimmed) kernel that spans a
+    // narrow ADDED kernel does NOT hide it — a green cell appears in the lane.
+    #[test]
+    fn test_wide_matched_does_not_hide_added() {
+        let t0 = Trace {
+            kernels: vec![k(1, 100.0, "reduce", 400.0), k(1, 200.0, "gone", 20.0)],
+            annotations: vec![],
+        };
+        let t1 = Trace {
+            kernels: vec![k(1, 100.0, "reduce", 400.0), k(1, 200.0, "extra", 20.0)],
+            annotations: vec![],
+        };
+        let mut app = App::new_multi(vec![("A".into(), t0), ("B".into(), t1)]);
+        // Park selection so nothing turns white.
+        app.active_lane = usize::MAX;
+        let lane1 = app
+            .lanes
+            .iter()
+            .position(|l| !l.is_annotations() && l.trace_id() == 1)
+            .unwrap();
+        let spans = build_lane(&app, lane1, 100.0, 400.0, 400);
+        let colors = bgs(&spans);
+        assert!(
+            colors.contains(&DIFF_ADDED),
+            "green (added) cell visible over the wide matched reduce"
+        );
+    }
 }

@@ -65,10 +65,15 @@ pytorch-trace-tui
 | `S` / `↓`       | Zoom out                        |
 | `Tab`           | Next lane                       |
 | `Shift+Tab`     | Previous lane                   |
-| `/`             | Incremental name search (kernels and annotations) |
+| `/`             | Incremental name search (kernels and annotations); `Enter` / `Shift+Enter` cycle to the next / previous match, `Tab` keeps the current match, `Esc` cancels |
 | `N`             | Show the kernel sequence from the selected kernel (see below) |
-| `G`             | Align the other traces to the selected kernel (multi-trace only) |
-| `Q` / `Esc`     | Quit                            |
+| `E`             | Export all kernels of the current lane to a CSV file in the working directory |
+| `G`             | Toggle diff / normal alignment (two traces only) |
+| `Q`             | Quit                            |
+
+You can also use the **mouse**: left-click a kernel or annotation to select it
+(clicking empty space in a lane selects the nearest item, and clicking a lane's
+label just switches to that lane), and scroll the wheel to zoom in and out.
 
 In the **sequence popup** (opened with `N`):
 
@@ -102,17 +107,43 @@ are interleaved by row — lane 1 of every trace, then lane 2 of every trace, an
 so on — and each lane is labelled with the part of its filename that differs from
 the others (e.g. `baseline` vs `tuned`).
 
-Because independently captured traces have unrelated absolute timestamps, they
-are **aligned** so equivalent work lines up:
+Because independently captured traces have unrelated absolute timestamps, every
+trace is **zero-based** to the earliest event across all traces, so they all
+start at the same left edge with their internal timing preserved.
 
-- **On load**, traces are shifted so their first shared `gpu_user_annotation`
-  starts at the same point. If no annotation name is common to all traces, they
-  are left unaligned (a warning is printed) and you can align manually.
-- **Press `G`** on any selected kernel to realign: the trace you are in stays
-  put, and every other trace slides so its nearest same-named kernel lines up
-  under your selection. The header shows what the traces are currently aligned
-  on. Alignment is a pure time shift (no scaling), so duration differences —
-  exactly what you are usually comparing — stay visible.
+### Two traces — diff / normal toggle
+
+When you open **exactly two** traces they start in **diff** mode. Press `G` to
+toggle between **diff** and **normal**; the header shows the current mode.
+
+**Diff mode** aligns the traces by a `git diff`-style (Myers) comparison of each
+shared stream's **kernel-name sequence**:
+
+- The **first trace is the anchor**. It keeps its real kernel positions and the
+  idle gaps between them — except that a new gap is inserted wherever a kernel
+  appears only in the second trace, and everything after it shifts right by the
+  width of that inserted run.
+- **Matched kernels** in the second trace snap their start onto the anchor
+  kernel's position, while keeping their **own duration** — so duration
+  differences (exactly what you are comparing) stay visible.
+- **Second-trace-only kernels** land in the inserted anchor gap; the anchor lane
+  shows empty space there.
+- **First-trace-only kernels** stay put; the second trace simply has nothing at
+  that position.
+- **Annotations** are carried along the same remap, so each `gpu_user_annotation`
+  span follows the kernels it brackets.
+
+Diff mode also **colour-codes** the kernels: **added** kernels (only in the second
+trace) are green, **deleted** kernels (only in the anchor) are red, and matched
+kernels are dimmed so the differences stand out.
+
+**Normal mode** skips the diff and just zero-bases both traces to the common
+start, showing each trace's raw timing side by side.
+
+### Three or more traces
+
+Three or more traces are always rendered in **normal** mode — zero-based to the
+common start, no diff. `G` has no effect.
 
 ## Kernel sequences
 

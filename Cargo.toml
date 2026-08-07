@@ -22,6 +22,7 @@ clap = { version = "4", features = ["derive"] }
 anyhow = "1"
 flate2 = "1"
 arboard = { version = "3.6", features = ["wayland-data-control"] }
+similar = "3"
 
 [profile.release]
 strip = true

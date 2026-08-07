@@ -18,8 +18,9 @@ impl ClipboardManager {
     }
 
     /// Copy `text` to the system clipboard. arboard is tried first; OSC 52 is
-    /// emitted to `out` as a terminal fallback. A CSV file is ALWAYS written so
-    /// the data is recoverable even when both clipboard paths silently no-op.
+    /// emitted to `out` as a terminal fallback. A CSV file is ALWAYS written to
+    /// the current working directory so the data is recoverable even when both
+    /// clipboard paths silently no-op.
     pub fn copy<W: Write>(&mut self, text: &str, out: &mut W) -> std::io::Result<CopyOutcome> {
         let via_native = self
             .native
@@ -29,7 +30,8 @@ impl ClipboardManager {
 
         let via_osc52 = self.emit_osc52(text, out).is_ok();
 
-        let file_path = std::env::temp_dir().join(format!(
+        let dir = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+        let file_path = dir.join(format!(
             "kernel-sequence-{}.csv",
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)

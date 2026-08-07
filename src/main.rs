@@ -7,7 +7,10 @@ use anyhow::{bail, Context, Result};
 use app::App;
 use clap::Parser;
 use crossterm::{
-    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind},
+    event::{
+        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
+        MouseButton, MouseEventKind,
+    },
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -299,23 +302,32 @@ fn event_loop(
                     if app.search_active {
                         match key.code {
                             KeyCode::Esc => app.search_cancel(),
-                            KeyCode::Enter => app.search_commit(),
+                            KeyCode::Tab => app.search_commit(),
+                            KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                                app.search_prev();
+                            }
+                            KeyCode::Enter => app.search_next(),
+                            KeyCode::BackTab => app.search_prev(),
                             KeyCode::Backspace => app.search_backspace(),
                             KeyCode::Char(c) => app.search_push(c),
                             _ => {}
                         }
                         continue;
                     }
+                    app.status = None;
                     match key.code {
-                        KeyCode::Char('q') | KeyCode::Char('Q') | KeyCode::Esc => break,
+                        KeyCode::Char('q') | KeyCode::Char('Q') => break,
                         KeyCode::Char('/') => {
                             app.search_start();
                         }
                         KeyCode::Char('n') | KeyCode::Char('N') => {
                             app.start_sequence();
                         }
+                        KeyCode::Char('e') | KeyCode::Char('E') => {
+                            app.status = Some(export_lane_csv(app));
+                        }
                         KeyCode::Char('g') | KeyCode::Char('G') => {
-                            app.align_to_selected_kernel();
+                            app.toggle_align_mode();
                         }
                         KeyCode::Char('a') | KeyCode::Char('A') | KeyCode::Left => {
                             app.prev_item();
@@ -339,12 +351,39 @@ fn event_loop(
                     }
                 }
                 Event::Resize(_, _) => {}
+                Event::Mouse(m) if app.sequence.is_none() && !app.search_active => {
+                    match m.kind {
+                        MouseEventKind::Down(MouseButton::Left) => {
+                            app.click_select(m.column, m.row);
+                        }
+                        MouseEventKind::ScrollUp => app.zoom_in(),
+                        MouseEventKind::ScrollDown => app.zoom_out(),
+                        _ => {}
+                    }
+                }
                 _ => {}
             }
         }
     }
 
     Ok(())
+}
+
+/// Writes the active kernel lane's kernels to a CSV file in the current
+/// directory and returns a one-line status for the header. A no-op status is
+/// returned when the active lane is not a kernel lane.
+fn export_lane_csv(app: &App) -> String {
+    let Some(csv) = app.lane_kernels_csv() else {
+        return "export: not a kernel lane".to_string();
+    };
+    let name = app.lane_csv_filename();
+    match std::fs::write(&name, &csv) {
+        Ok(()) => {
+            let rows = csv.lines().count().saturating_sub(1);
+            format!("exported {} kernels to {}", rows, name)
+        }
+        Err(e) => format!("export failed: {}", e),
+    }
 }
 
 /// Number of scrollable kernel rows the sequence popup shows. Mirrors the UI's

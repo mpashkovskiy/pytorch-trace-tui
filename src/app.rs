@@ -64,14 +64,75 @@ pub struct Sequence {
     pub scroll: usize,
 }
 
-/// Per-trace metadata for multi-trace alignment. `offset_us` is added to every
-/// raw timestamp of this trace so a shared anchor annotation lines up on the
-/// common time axis.
+/// Per-trace metadata. Holds only the display label; render positions live in
+/// the per-event override vectors on `App`.
 #[derive(Debug, Clone)]
 pub struct TraceMeta {
     pub label: String,
-    pub offset_us: f64,
-    pub anchor: Option<String>,
+}
+
+/// How exactly two traces are laid out on the shared time axis.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AlignMode {
+    /// Kernel-sequence git diff: matched kernels snap onto the anchor trace and
+    /// unmatched kernels open inserted gaps.
+    Diff,
+    /// Every trace zero-based to a common start; internal timing preserved.
+    Normal,
+}
+
+/// Per-kernel git-diff classification in two-trace diff mode. Matched kernels
+/// carry no status (`None` in `kernel_diff_status`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KernelDiff {
+    /// Present only in the second trace (a diff insertion).
+    Added,
+    /// Present only in the anchor trace (a diff deletion).
+    Deleted,
+}
+
+/// Winning render class for a single terminal column in a kernel lane. When
+/// several kernels overlap one column, the highest-ranked class wins so a wide
+/// matched (dimmed) block never hides a narrower added/deleted one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ColumnClass {
+    Selected,
+    Deleted,
+    Added,
+    /// Unchanged kernel: dimmed in diff mode, normal base colour otherwise.
+    Matched,
+}
+
+impl ColumnClass {
+    fn rank(self) -> u8 {
+        match self {
+            ColumnClass::Selected => 4,
+            ColumnClass::Deleted => 3,
+            ColumnClass::Added => 2,
+            ColumnClass::Matched => 1,
+        }
+    }
+}
+
+/// Screen geometry of the last-rendered lane area, recorded by the UI so mouse
+/// clicks can be reverse-mapped to a lane and an item. All fields are in
+/// terminal cell coordinates except the time window.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct LaneLayout {
+    /// Top-left of the lane block interior (inside the border).
+    pub inner_x: u16,
+    pub inner_y: u16,
+    /// Interior height in rows (one lane per row).
+    pub inner_h: u16,
+    /// Width of the label gutter (label text plus the `│` separator).
+    pub label_width: u16,
+    /// Width of the timeline area to the right of the gutter.
+    pub lane_width: u16,
+    /// First lane index shown at `inner_y` (mirrors `lane_view_offset`).
+    pub view_offset: usize,
+    /// Aligned time window mapped across `lane_width`.
+    pub ts_start: f64,
+    pub time_span: f64,
 }
 
 #[derive(Debug, Clone)]
@@ -81,6 +142,7 @@ pub struct App {
     pub streams: Vec<u64>,
     pub lanes: Vec<Lane>,
     pub traces: Vec<TraceMeta>,
+    pub align_mode: AlignMode,
     pub active_lane: usize,
     pub selected_item: usize,
     pub zoom_level: f64,
@@ -88,8 +150,27 @@ pub struct App {
     pub search_active: bool,
     pub search_query: String,
     pub search_no_match: bool,
+    /// All items matching the current query as `(lane_idx, item_pos)`, ordered by
+    /// lane then position; cycled by `search_next` / `search_prev`.
+    pub search_matches: Vec<(usize, usize)>,
+    /// Index into `search_matches` of the currently selected match.
+    pub search_match_idx: usize,
     pub sequence: Option<Sequence>,
     pub sequence_status: Option<String>,
+    /// Transient one-line status shown in the header (e.g. after a CSV export),
+    /// cleared on the next key press.
+    pub status: Option<String>,
+    /// Absolute render-start per kernel (by flat index), always populated by
+    /// `recompute_alignment`.
+    pub kernel_render_overrides: Vec<Option<f64>>,
+    /// Absolute (start, end) render span per annotation (by flat index), always
+    /// populated by `recompute_alignment`.
+    pub annotation_render_overrides: Vec<Option<(f64, f64)>>,
+    /// Per-kernel git-diff status (by flat index) in two-trace diff mode; `None`
+    /// for matched kernels and in every non-diff layout.
+    pub kernel_diff_status: Vec<Option<KernelDiff>>,
+    /// Screen geometry of the last-rendered lane area, for mouse hit-testing.
+    pub lane_layout: LaneLayout,
 }
 
 impl App {
@@ -99,8 +180,9 @@ impl App {
     }
 
     /// Build an App from one or more labelled traces. Each trace's events are
-    /// stamped with its trace index, alignment offsets are computed from the
-    /// first shared annotation name, and lanes are interleaved round-robin.
+    /// stamped with its trace index, lanes are interleaved round-robin, and
+    /// render positions are computed by `recompute_alignment` (default: diff
+    /// mode for exactly two traces, normal zero-base otherwise).
     pub fn new_multi(labelled: Vec<(String, Trace)>) -> Self {
         let mut kernels: Vec<KernelEvent> = Vec::new();
         let mut annotations: Vec<AnnotationEvent> = Vec::new();
@@ -123,7 +205,7 @@ impl App {
         }
         let trace_count = labels.len();
 
-        let traces = compute_alignment(&annotations, &labels);
+        let traces: Vec<TraceMeta> = labels.into_iter().map(|label| TraceMeta { label }).collect();
 
         let mut streams: Vec<u64> = kernels
             .iter()
@@ -148,12 +230,17 @@ impl App {
             .position(|l| !l.is_annotations())
             .unwrap_or(0);
 
+        let kernel_render_overrides = vec![None; kernels.len()];
+        let annotation_render_overrides = vec![None; annotations.len()];
+        let kernel_diff_status = vec![None; kernels.len()];
+
         let mut app = App {
             kernels,
             annotations,
             streams,
             lanes,
             traces,
+            align_mode: AlignMode::Diff,
             active_lane: initial_lane,
             selected_item: 0,
             zoom_level: 1.0,
@@ -161,9 +248,17 @@ impl App {
             search_active: false,
             search_query: String::new(),
             search_no_match: false,
+            search_matches: Vec::new(),
+            search_match_idx: 0,
             sequence: None,
             sequence_status: None,
+            status: None,
+            kernel_render_overrides,
+            annotation_render_overrides,
+            kernel_diff_status,
+            lane_layout: LaneLayout::default(),
         };
+        app.recompute_alignment();
         app.clamp_selected_item();
         app
     }
@@ -199,49 +294,116 @@ impl App {
             .unwrap_or(false)
     }
 
-    fn trace_offset(&self, trace_id: usize) -> f64 {
-        self.traces.get(trace_id).map(|t| t.offset_us).unwrap_or(0.0)
-    }
-
-    /// Aligned start ts of kernel `idx`: raw ts + its trace's alignment offset.
+    /// Absolute render-start of kernel `idx` on the shared axis.
     pub fn kernel_render_ts(&self, idx: usize) -> f64 {
-        self.kernels
-            .get(idx)
-            .map(|k| k.ts + self.trace_offset(k.trace_id))
-            .unwrap_or(0.0)
+        match self.kernel_render_overrides.get(idx) {
+            Some(Some(ts)) => *ts,
+            _ => self.kernels.get(idx).map(|k| k.ts).unwrap_or(0.0),
+        }
     }
 
     pub fn kernel_render_end(&self, idx: usize) -> f64 {
-        self.kernels
-            .get(idx)
-            .map(|k| k.end_ts() + self.trace_offset(k.trace_id))
-            .unwrap_or(0.0)
+        let dur = self.kernels.get(idx).map(|k| k.dur).unwrap_or(0.0);
+        self.kernel_render_ts(idx) + dur
     }
 
     pub fn annotation_render_ts(&self, idx: usize) -> f64 {
-        self.annotations
-            .get(idx)
-            .map(|a| a.ts + self.trace_offset(a.trace_id))
-            .unwrap_or(0.0)
+        match self.annotation_render_overrides.get(idx) {
+            Some(Some((start, _))) => *start,
+            _ => self.annotations.get(idx).map(|a| a.ts).unwrap_or(0.0),
+        }
     }
 
     pub fn annotation_render_end(&self, idx: usize) -> f64 {
-        self.annotations
-            .get(idx)
-            .map(|a| a.end_ts() + self.trace_offset(a.trace_id))
-            .unwrap_or(0.0)
+        match self.annotation_render_overrides.get(idx) {
+            Some(Some((_, end))) => *end,
+            _ => self.annotations.get(idx).map(|a| a.end_ts()).unwrap_or(0.0),
+        }
     }
 
-    /// Human-readable alignment status for the header, or None for a single
-    /// trace where alignment is not meaningful.
-    pub fn alignment_label(&self) -> Option<String> {
-        if self.traces.len() < 2 {
+    /// Git-diff status of kernel `idx`: `Some(Added|Deleted)` only for unmatched
+    /// kernels in two-trace diff mode, `None` otherwise.
+    pub fn kernel_diff(&self, idx: usize) -> Option<KernelDiff> {
+        self.kernel_diff_status.get(idx).copied().flatten()
+    }
+
+    /// Per-column winning `(class, owner_pos)` for a kernel lane at the given
+    /// window and `width`, applying the priority order
+    /// Selected > Deleted > Added > Matched. `owner_pos` indexes the lane's
+    /// `item_indices()`. Columns with no kernel are `None`. When `diff_active` is
+    /// false, every non-selected kernel column is `Matched` (the UI maps that to
+    /// the normal base colour rather than a dimmed one).
+    pub fn lane_column_classes(
+        &self,
+        lane_idx: usize,
+        ts_start: f64,
+        time_span: f64,
+        width: usize,
+        diff_active: bool,
+    ) -> Vec<Option<(ColumnClass, usize)>> {
+        let mut cols: Vec<Option<(ColumnClass, usize)>> = vec![None; width];
+        if width == 0 {
+            return cols;
+        }
+        let Some(lane) = self.lanes.get(lane_idx) else {
+            return cols;
+        };
+        let is_active_lane = lane_idx == self.active_lane;
+        let ts_end = ts_start + time_span;
+
+        for (pos, &item_idx) in lane.item_indices().iter().enumerate() {
+            let class = if is_active_lane && pos == self.selected_item {
+                ColumnClass::Selected
+            } else if !diff_active {
+                ColumnClass::Matched
+            } else {
+                match self.kernel_diff(item_idx) {
+                    Some(KernelDiff::Added) => ColumnClass::Added,
+                    Some(KernelDiff::Deleted) => ColumnClass::Deleted,
+                    None => ColumnClass::Matched,
+                }
+            };
+            let (start, end) = match lane {
+                Lane::Kernels { .. } => (
+                    self.kernel_render_ts(item_idx),
+                    self.kernel_render_end(item_idx),
+                ),
+                Lane::Annotations { .. } => (
+                    self.annotation_render_ts(item_idx),
+                    self.annotation_render_end(item_idx),
+                ),
+            };
+            let Some((start_col, end_col)) =
+                kernel_columns(start, end, ts_start, ts_end, width)
+            else {
+                continue;
+            };
+            for cell in cols.iter_mut().take(end_col).skip(start_col) {
+                let win = match cell {
+                    Some((c, _)) => class.rank() > c.rank(),
+                    None => true,
+                };
+                if win {
+                    *cell = Some((class, pos));
+                }
+            }
+        }
+        cols
+    }
+
+    /// Header label for the current alignment mode when exactly two traces are
+    /// open (`"diff"` / `"normal"`), or `None` otherwise.
+    pub fn mode_label(&self) -> Option<String> {
+        if self.traces.len() != 2 {
             return None;
         }
-        match self.traces.first().and_then(|t| t.anchor.as_deref()) {
-            Some(name) => Some(format!("aligned on {:?}", name)),
-            None => Some("not aligned (no shared annotation)".to_string()),
-        }
+        Some(
+            match self.align_mode {
+                AlignMode::Diff => "diff",
+                AlignMode::Normal => "normal",
+            }
+            .to_string(),
+        )
     }
 
     /// Per-trace display labels shortened to their differing part (common prefix
@@ -251,52 +413,113 @@ impl App {
         shorten_labels(&labels)
     }
 
-    /// Realigns other traces to the currently-selected kernel: the selected
-    /// trace stays fixed, and every other trace is shifted so its same-named
-    /// kernel nearest (by aligned start) to the selection slides onto it. No-op
-    /// unless a kernel is selected. Returns whether an alignment was performed.
-    pub fn align_to_selected_kernel(&mut self) -> bool {
-        let lane = match self.lanes.get(self.active_lane) {
-            Some(l) if !l.is_annotations() => l,
-            _ => return false,
-        };
-        let Some(&kidx) = lane.item_indices().get(self.selected_item) else {
+    /// Toggles between diff and normal alignment for exactly two traces and
+    /// recomputes render positions. No-op (returns false) for any other count.
+    pub fn toggle_align_mode(&mut self) -> bool {
+        if self.traces.len() != 2 {
             return false;
+        }
+        self.align_mode = match self.align_mode {
+            AlignMode::Diff => AlignMode::Normal,
+            AlignMode::Normal => AlignMode::Diff,
         };
-        let Some(kernel) = self.kernels.get(kidx) else {
-            return false;
-        };
-        let ref_trace = kernel.trace_id;
-        let name = kernel.name.clone();
-        let target = self.kernel_render_ts(kidx);
+        self.recompute_alignment();
+        true
+    }
 
-        for tid in 0..self.traces.len() {
-            if tid == ref_trace {
+    /// Rebuilds both render-override vectors from scratch for the current mode.
+    /// Every event is first zero-based to the common global start (normal); for
+    /// exactly two traces in diff mode, each common stream's kernels are then
+    /// remapped by the git-diff and its annotations carried along a per-stream
+    /// `TimeMap` built from the kernel control points.
+    pub fn recompute_alignment(&mut self) {
+        let trace_count = self.traces.len();
+        let normal_off = self.normal_offsets();
+
+        for (i, k) in self.kernels.iter().enumerate() {
+            self.kernel_render_overrides[i] = Some(k.ts + normal_off[k.trace_id]);
+        }
+        for (i, a) in self.annotations.iter().enumerate() {
+            let off = normal_off[a.trace_id];
+            self.annotation_render_overrides[i] = Some((a.ts + off, a.end_ts() + off));
+        }
+        for s in &mut self.kernel_diff_status {
+            *s = None;
+        }
+
+        if trace_count != 2 || self.align_mode != AlignMode::Diff {
+            return;
+        }
+
+        let mut streams: Vec<u64> = self.kernels.iter().map(|k| k.stream).collect();
+        streams.sort_unstable();
+        streams.dedup();
+
+        for stream in streams {
+            let idx0 = stream_kernel_indices(&self.kernels, 0, stream);
+            let idx1 = stream_kernel_indices(&self.kernels, 1, stream);
+            if idx0.is_empty() || idx1.is_empty() {
                 continue;
             }
-            let nearest = self
-                .kernels
-                .iter()
-                .enumerate()
-                .filter(|(_, k)| k.trace_id == tid && k.name == name)
-                .map(|(i, _)| self.kernel_render_ts(i))
-                .min_by(|a, b| {
-                    (a - target)
-                        .abs()
-                        .partial_cmp(&(b - target).abs())
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                });
-            if let Some(aligned_start) = nearest {
-                if let Some(meta) = self.traces.get_mut(tid) {
-                    meta.offset_us += target - aligned_start;
-                }
+            let (ctrl0, ctrl1) = remap_stream(
+                &self.kernels,
+                &idx0,
+                &idx1,
+                normal_off[0],
+                normal_off[1],
+                &mut self.kernel_render_overrides,
+                &mut self.kernel_diff_status,
+            );
+            let map0 = TimeMap::new(ctrl0, normal_off[0]);
+            let map1 = TimeMap::new(ctrl1, normal_off[1]);
+            self.remap_stream_annotations(stream, 0, &map0);
+            self.remap_stream_annotations(stream, 1, &map1);
+        }
+    }
+
+    /// Per-trace normal offset that zero-bases every trace to the earliest raw
+    /// timestamp across all traces: `offset[t] = global_min - trace_min[t]`.
+    fn normal_offsets(&self) -> Vec<f64> {
+        let n = self.traces.len();
+        let mut trace_min = vec![f64::MAX; n];
+        for k in &self.kernels {
+            if k.ts < trace_min[k.trace_id] {
+                trace_min[k.trace_id] = k.ts;
             }
         }
-
-        for meta in &mut self.traces {
-            meta.anchor = Some(name.clone());
+        for a in &self.annotations {
+            if a.ts < trace_min[a.trace_id] {
+                trace_min[a.trace_id] = a.ts;
+            }
         }
-        true
+        let global_min = trace_min
+            .iter()
+            .copied()
+            .filter(|v| v.is_finite())
+            .fold(f64::MAX, f64::min);
+        let global_min = if global_min.is_finite() {
+            global_min
+        } else {
+            0.0
+        };
+        trace_min
+            .iter()
+            .map(|&m| if m.is_finite() { global_min - m } else { 0.0 })
+            .collect()
+    }
+
+    /// Overwrites annotation overrides on one (trace, stream) by mapping each
+    /// annotation's start and end through the stream's diff `TimeMap`.
+    fn remap_stream_annotations(&mut self, stream: u64, trace_id: usize, map: &TimeMap) {
+        for i in 0..self.annotations.len() {
+            let a = &self.annotations[i];
+            if a.trace_id != trace_id || a.stream != stream {
+                continue;
+            }
+            let start = map.map(a.ts);
+            let end = start.max(map.map(a.end_ts()));
+            self.annotation_render_overrides[i] = Some((start, end));
+        }
     }
 
     pub fn selected_trace_item(&self) -> Option<SelectedTraceItem<'_>> {
@@ -405,18 +628,114 @@ impl App {
         self.zoom_level = (self.zoom_level / ZOOM_FACTOR).max(ZOOM_MIN);
     }
 
+    // ── Mouse ────────────────────────────────────────────────────────────────
+
+    /// Lane index shown at terminal row `row`, if the row falls within the
+    /// rendered lane area and maps to an existing lane.
+    fn lane_at_row(&self, row: u16) -> Option<usize> {
+        let lo = &self.lane_layout;
+        if row < lo.inner_y || row >= lo.inner_y + lo.inner_h {
+            return None;
+        }
+        let lane_idx = lo.view_offset + (row - lo.inner_y) as usize;
+        (lane_idx < self.lanes.len()).then_some(lane_idx)
+    }
+
+    /// Item position within `lane_idx` whose rendered columns cover terminal
+    /// column `col`, or the nearest item's position when the click lands on
+    /// empty timeline space. `None` only if the lane has no items or the click
+    /// is left of the timeline gutter.
+    fn item_at_col(&self, lane_idx: usize, col: u16) -> Option<usize> {
+        let lo = &self.lane_layout;
+        let lane = self.lanes.get(lane_idx)?;
+        let n = lane.item_indices().len();
+        if n == 0 {
+            return None;
+        }
+        let lane_x0 = lo.inner_x + lo.label_width;
+        if col < lane_x0 || lo.lane_width == 0 {
+            return None;
+        }
+        let click = (col - lane_x0) as usize;
+        let width = lo.lane_width as usize;
+        let ts_end = lo.ts_start + lo.time_span;
+
+        let mut nearest = 0usize;
+        let mut nearest_dist = usize::MAX;
+        for pos in 0..n {
+            let (ts, end) = self.item_render_span(lane, pos);
+            let Some((s, e)) = kernel_columns(ts, end, lo.ts_start, ts_end, width) else {
+                continue;
+            };
+            if click >= s && click < e {
+                return Some(pos);
+            }
+            let center = (s + e) / 2;
+            let dist = center.abs_diff(click);
+            if dist < nearest_dist {
+                nearest_dist = dist;
+                nearest = pos;
+            }
+        }
+        Some(nearest)
+    }
+
+    /// Rendered (start, end) timestamps of the item at `pos` in `lane`.
+    fn item_render_span(&self, lane: &Lane, pos: usize) -> (f64, f64) {
+        let idx = lane.item_indices().get(pos).copied().unwrap_or(0);
+        match lane {
+            Lane::Kernels { .. } => (self.kernel_render_ts(idx), self.kernel_render_end(idx)),
+            Lane::Annotations { .. } => (
+                self.annotation_render_ts(idx),
+                self.annotation_render_end(idx),
+            ),
+        }
+    }
+
+    /// Handles a left click at terminal `(col, row)`. A click in a lane's
+    /// timeline selects the item under (or nearest to) the cursor; a click in
+    /// the label gutter just activates that lane. Returns whether anything was
+    /// selected.
+    pub fn click_select(&mut self, col: u16, row: u16) -> bool {
+        let Some(lane_idx) = self.lane_at_row(row) else {
+            return false;
+        };
+        let lo = self.lane_layout;
+        let in_gutter = col < lo.inner_x + lo.label_width;
+
+        self.active_lane = lane_idx;
+        if in_gutter {
+            self.clamp_selected_item();
+            return true;
+        }
+        match self.item_at_col(lane_idx, col) {
+            Some(pos) => {
+                self.selected_item = pos;
+                true
+            }
+            None => {
+                self.clamp_selected_item();
+                true
+            }
+        }
+    }
+
     // ── Search over BOTH lane kinds ──────────────────────────────────────────
 
     pub fn search_start(&mut self) {
         self.search_active = true;
         self.search_query.clear();
         self.search_no_match = false;
+        self.search_matches.clear();
+        self.search_match_idx = 0;
     }
 
     pub fn search_cancel(&mut self) {
         self.search_active = false;
         self.search_query.clear();
         self.search_no_match = false;
+        self.search_matches.clear();
+        self.search_match_idx = 0;
     }
 
     pub fn search_commit(&mut self) {
@@ -433,7 +752,11 @@ impl App {
         self.search_apply();
     }
 
+    /// Rebuilds the ordered match list for the current query and jumps to the
+    /// first match. Empty query clears matches and the no-match flag.
     fn search_apply(&mut self) {
+        self.search_matches.clear();
+        self.search_match_idx = 0;
         if self.search_query.is_empty() {
             self.search_no_match = false;
             return;
@@ -449,15 +772,60 @@ impl App {
                 };
                 if let Some(name) = name {
                     if name.to_lowercase().contains(&needle) {
-                        self.active_lane = lane_idx;
-                        self.selected_item = pos;
-                        self.search_no_match = false;
-                        return;
+                        self.search_matches.push((lane_idx, pos));
                     }
                 }
             }
         }
-        self.search_no_match = true;
+
+        if let Some(&(lane_idx, pos)) = self.search_matches.first() {
+            self.active_lane = lane_idx;
+            self.selected_item = pos;
+            self.search_no_match = false;
+        } else {
+            self.search_no_match = true;
+        }
+    }
+
+    /// Moves the selection to the next match, wrapping past the last to the
+    /// first. No-op when there are no matches.
+    pub fn search_next(&mut self) {
+        if self.search_matches.is_empty() {
+            return;
+        }
+        self.search_match_idx = (self.search_match_idx + 1) % self.search_matches.len();
+        self.goto_current_match();
+    }
+
+    /// Moves the selection to the previous match, wrapping past the first to the
+    /// last. No-op when there are no matches.
+    pub fn search_prev(&mut self) {
+        if self.search_matches.is_empty() {
+            return;
+        }
+        let n = self.search_matches.len();
+        self.search_match_idx = (self.search_match_idx + n - 1) % n;
+        self.goto_current_match();
+    }
+
+    fn goto_current_match(&mut self) {
+        if let Some(&(lane_idx, pos)) = self.search_matches.get(self.search_match_idx) {
+            self.active_lane = lane_idx;
+            self.selected_item = pos;
+        }
+    }
+
+    /// `"i/N"` position of the current match among all matches, or `None` when
+    /// the query has no matches.
+    pub fn search_match_label(&self) -> Option<String> {
+        if self.search_matches.is_empty() {
+            return None;
+        }
+        Some(format!(
+            "{}/{}",
+            self.search_match_idx + 1,
+            self.search_matches.len()
+        ))
     }
 
     // ── Sequence between same-named kernels (N key) ──────────────────────────
@@ -548,6 +916,59 @@ impl App {
             out.push_str(&format!("{}\t{}\t{:.2}\n", idx, name, med));
         }
         Some(out)
+    }
+
+    /// CSV of every kernel in the active lane (raw timestamps, full fields), or
+    /// `None` when the active lane is not a kernel lane. Row order matches the
+    /// lane's on-screen order.
+    pub fn lane_kernels_csv(&self) -> Option<String> {
+        let lane = self.lanes.get(self.active_lane)?;
+        let Lane::Kernels { item_indices, .. } = lane else {
+            return None;
+        };
+        let mut out = String::from(
+            "idx,name,ts,dur,end_ts,stream,device,grid,block,shared_memory,\
+             registers_per_thread,correlation\n",
+        );
+        let opt_u64 = |v: Option<u64>| v.map(|n| n.to_string()).unwrap_or_default();
+        for (row, &ki) in item_indices.iter().enumerate() {
+            let Some(k) = self.kernels.get(ki) else {
+                continue;
+            };
+            out.push_str(&format!(
+                "{},{},{},{},{},{},{},{},{},{},{},{}\n",
+                row + 1,
+                csv_escape(&k.name),
+                k.ts,
+                k.dur,
+                k.end_ts(),
+                k.stream,
+                k.device,
+                csv_escape(k.grid.as_deref().unwrap_or("")),
+                csv_escape(k.block.as_deref().unwrap_or("")),
+                opt_u64(k.shared_memory),
+                opt_u64(k.registers_per_thread),
+                opt_u64(k.correlation),
+            ));
+        }
+        Some(out)
+    }
+
+    /// Suggested filename for the active kernel lane's CSV dump, e.g.
+    /// `lane-cuda4-trace0.csv` (trace suffix only when multiple traces are open).
+    pub fn lane_csv_filename(&self) -> String {
+        let Some(lane) = self.lanes.get(self.active_lane) else {
+            return "lane.csv".to_string();
+        };
+        if self.traces.len() > 1 {
+            format!(
+                "lane-cuda{}-trace{}.csv",
+                lane.stream_id(),
+                lane.trace_id()
+            )
+        } else {
+            format!("lane-cuda{}.csv", lane.stream_id())
+        }
     }
 
     /// Scan forward for every block whose ordered kernel names exactly match the
@@ -679,80 +1100,205 @@ impl App {
     }
 }
 
-/// Build the flat, ordered lane list. For each stream (sorted) we emit its
-/// Earliest start ts of the given annotation name within one trace, if present.
-fn anchor_ts(annotations: &[AnnotationEvent], trace_id: usize, name: &str) -> Option<f64> {
-    annotations
+/// A `(raw_ts, render_ts)` control point pair for the annotation `TimeMap`.
+type ControlPoints = Vec<(f64, f64)>;
+
+/// Flat kernel indices for one trace's one stream, sorted by raw timestamp.
+fn stream_kernel_indices(kernels: &[KernelEvent], trace_id: usize, stream: u64) -> Vec<usize> {
+    let mut idx: Vec<usize> = kernels
         .iter()
-        .filter(|a| a.trace_id == trace_id && a.name == name)
-        .map(|a| a.ts)
-        .min_by(|x, y| x.partial_cmp(y).unwrap_or(std::cmp::Ordering::Equal))
+        .enumerate()
+        .filter(|(_, k)| k.trace_id == trace_id && k.stream == stream)
+        .map(|(i, _)| i)
+        .collect();
+    idx.sort_by(|&a, &b| {
+        kernels[a]
+            .ts
+            .partial_cmp(&kernels[b].ts)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    idx
 }
 
-/// Computes per-trace alignment offsets. The anchor is the first annotation name
-/// (in trace 0's timestamp order) that appears in EVERY trace; each trace is then
-/// shifted so that anchor's start coincides with trace 0's. If no name is shared,
-/// all offsets are 0 and a warning is emitted to stderr.
-fn compute_alignment(annotations: &[AnnotationEvent], labels: &[String]) -> Vec<TraceMeta> {
-    let trace_count = labels.len();
+/// A monotonic piecewise-linear map from raw timestamps to render timestamps,
+/// built from `(raw_kernel_start, assigned_render_start)` control points. Used to
+/// carry annotations along the same remap their stream's kernels underwent in
+/// diff mode. Below the first / above the last control it extrapolates by that
+/// control's constant shift.
+struct TimeMap {
+    controls: Vec<(f64, f64)>,
+    normal_off: f64,
+}
 
-    let mut t0_names: Vec<&str> = annotations
-        .iter()
-        .filter(|a| a.trace_id == 0)
-        .map(|a| (a.ts, a.name.as_str()))
-        .collect::<Vec<_>>()
-        .into_iter()
-        .fold(Vec::new(), |mut acc, (_, n)| {
-            if !acc.contains(&n) {
-                acc.push(n);
-            }
-            acc
-        });
-    // Order candidate names by earliest occurrence in trace 0.
-    t0_names.sort_by(|a, b| {
-        let ta = anchor_ts(annotations, 0, a).unwrap_or(f64::MAX);
-        let tb = anchor_ts(annotations, 0, b).unwrap_or(f64::MAX);
-        ta.partial_cmp(&tb).unwrap_or(std::cmp::Ordering::Equal)
-    });
-
-    let anchor = t0_names.into_iter().find(|name| {
-        (0..trace_count).all(|tid| anchor_ts(annotations, tid, name).is_some())
-    });
-
-    match anchor {
-        Some(name) => {
-            let ref_ts = anchor_ts(annotations, 0, name).unwrap_or(0.0);
-            labels
-                .iter()
-                .enumerate()
-                .map(|(tid, label)| {
-                    let this_ts = anchor_ts(annotations, tid, name).unwrap_or(ref_ts);
-                    TraceMeta {
-                        label: label.clone(),
-                        offset_us: ref_ts - this_ts,
-                        anchor: Some(name.to_string()),
-                    }
-                })
-                .collect()
-        }
-        None => {
-            if trace_count > 1 {
-                eprintln!(
-                    "warning: no annotation name shared across all {} traces; \
-                     rendering without alignment (raw timestamps).",
-                    trace_count
-                );
-            }
-            labels
-                .iter()
-                .map(|label| TraceMeta {
-                    label: label.clone(),
-                    offset_us: 0.0,
-                    anchor: None,
-                })
-                .collect()
+impl TimeMap {
+    fn new(mut controls: Vec<(f64, f64)>, normal_off: f64) -> Self {
+        controls.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+        TimeMap {
+            controls,
+            normal_off,
         }
     }
+
+    fn map(&self, t: f64) -> f64 {
+        let n = self.controls.len();
+        if n == 0 {
+            return t + self.normal_off;
+        }
+        let (first_raw, first_render) = self.controls[0];
+        if t <= first_raw {
+            return t + (first_render - first_raw);
+        }
+        let (last_raw, last_render) = self.controls[n - 1];
+        if t >= last_raw {
+            return t + (last_render - last_raw);
+        }
+        for w in self.controls.windows(2) {
+            let (raw_i, render_i) = w[0];
+            let (raw_j, render_j) = w[1];
+            if raw_i <= t && t <= raw_j {
+                if raw_j == raw_i {
+                    return t + (render_i - raw_i);
+                }
+                let alpha = (t - raw_i) / (raw_j - raw_i);
+                return render_i + alpha * (render_j - render_i);
+            }
+        }
+        t + (last_render - last_raw)
+    }
+}
+
+/// Diffs the two streams' kernel-name sequences, writing absolute render-start
+/// overrides for their kernels and returning the trace-0 and trace-1 control
+/// points `(raw_start, render_start)` so annotations can follow the same remap.
+/// `idx0`/`idx1` are ts-sorted flat kernel indices for trace 0 / 1; `base0`/
+/// `base1` are the per-trace normal offsets used as the un-shifted origin.
+fn remap_stream(
+    kernels: &[KernelEvent],
+    idx0: &[usize],
+    idx1: &[usize],
+    off0: f64,
+    off1: f64,
+    overrides: &mut [Option<f64>],
+    diff_status: &mut [Option<KernelDiff>],
+) -> (ControlPoints, ControlPoints) {
+    use similar::{capture_diff_slices, Algorithm, DiffOp};
+
+    let names0: Vec<&str> = idx0.iter().map(|&i| kernels[i].name.as_str()).collect();
+    let names1: Vec<&str> = idx1.iter().map(|&i| kernels[i].name.as_str()).collect();
+
+    let base0 = |local: usize| kernels[idx0[local]].ts + off0;
+    let base1 = |local: usize| kernels[idx1[local]].ts + off1;
+    let dur0 = |local: usize| kernels[idx0[local]].dur;
+    let dur1 = |local: usize| kernels[idx1[local]].dur;
+    let raw0 = |local: usize| kernels[idx0[local]].ts;
+    let raw1 = |local: usize| kernels[idx1[local]].ts;
+    let len0 = idx0.len();
+
+    let mut ctrl0: Vec<(f64, f64)> = Vec::new();
+    let mut ctrl1: Vec<(f64, f64)> = Vec::new();
+    let mut inserted_shift = 0.0f64;
+
+    let assign0 =
+        |local: usize, render: f64, ov: &mut [Option<f64>], c0: &mut Vec<(f64, f64)>| {
+            ov[idx0[local]] = Some(render);
+            c0.push((raw0(local), render));
+        };
+
+    // Places a run of trace-1-only kernels into a newly inserted anchor gap whose
+    // width is the run's span, advancing `shift` and recording trace-1 controls.
+    let apply_insert = |old_index: usize,
+                        new_index: usize,
+                        new_len: usize,
+                        shift: &mut f64,
+                        ov: &mut [Option<f64>],
+                        ds: &mut [Option<KernelDiff>],
+                        c1: &mut Vec<(f64, f64)>| {
+        if new_len == 0 {
+            return;
+        }
+        let run = new_index..new_index + new_len;
+        let insert_run_start = base1(new_index);
+        let insert_run_end = run
+            .clone()
+            .map(|j| base1(j) + dur1(j))
+            .fold(f64::MIN, f64::max);
+        let insert_width = (insert_run_end - insert_run_start).max(0.0);
+        let gap_start = if old_index < len0 {
+            base0(old_index) + *shift
+        } else {
+            base0(len0 - 1) + *shift + dur0(len0 - 1)
+        };
+        for j in run {
+            let render = gap_start + (base1(j) - insert_run_start);
+            ov[idx1[j]] = Some(render);
+            ds[idx1[j]] = Some(KernelDiff::Added);
+            c1.push((raw1(j), render));
+        }
+        *shift += insert_width;
+    };
+
+    for op in capture_diff_slices(Algorithm::Myers, &names0, &names1) {
+        match op {
+            DiffOp::Equal {
+                old_index,
+                new_index,
+                len,
+            } => {
+                for k in 0..len {
+                    let pos = base0(old_index + k) + inserted_shift;
+                    assign0(old_index + k, pos, overrides, &mut ctrl0);
+                    overrides[idx1[new_index + k]] = Some(pos);
+                    ctrl1.push((raw1(new_index + k), pos));
+                }
+            }
+            DiffOp::Delete {
+                old_index, old_len, ..
+            } => {
+                for k in 0..old_len {
+                    let pos = base0(old_index + k) + inserted_shift;
+                    assign0(old_index + k, pos, overrides, &mut ctrl0);
+                    diff_status[idx0[old_index + k]] = Some(KernelDiff::Deleted);
+                }
+            }
+            DiffOp::Insert {
+                old_index,
+                new_index,
+                new_len,
+            } => {
+                apply_insert(
+                    old_index,
+                    new_index,
+                    new_len,
+                    &mut inserted_shift,
+                    overrides,
+                    diff_status,
+                    &mut ctrl1,
+                );
+            }
+            DiffOp::Replace {
+                old_index,
+                old_len,
+                new_index,
+                new_len,
+            } => {
+                for k in 0..old_len {
+                    let pos = base0(old_index + k) + inserted_shift;
+                    assign0(old_index + k, pos, overrides, &mut ctrl0);
+                    diff_status[idx0[old_index + k]] = Some(KernelDiff::Deleted);
+                }
+                apply_insert(
+                    old_index + old_len,
+                    new_index,
+                    new_len,
+                    &mut inserted_shift,
+                    overrides,
+                    diff_status,
+                    &mut ctrl1,
+                );
+            }
+        }
+    }
+    (ctrl0, ctrl1)
 }
 
 /// Shortens trace labels to just their differing middle by stripping the common
@@ -902,6 +1448,16 @@ pub fn kernel_columns(
         return None;
     }
     Some((start_col, end_col))
+}
+
+/// Quotes a CSV field per RFC 4180 when it contains a comma, quote, or newline
+/// (grid/block values like `[32,1,1]` contain commas). Inner quotes are doubled.
+fn csv_escape(field: &str) -> String {
+    if field.contains([',', '"', '\n', '\r']) {
+        format!("\"{}\"", field.replace('"', "\"\""))
+    } else {
+        field.to_string()
+    }
 }
 
 /// Median of the durations. Even counts average the two middle values; only
@@ -1376,6 +1932,121 @@ mod tests {
         assert!(app.search_query.is_empty());
     }
 
+    // ── Search prev/next navigation ──────────────────────────────────────────
+
+    fn search_app() -> App {
+        // Four kernels matching "gemm" across two streams, plus one non-match.
+        app_from(vec![
+            named_kernel(3, 100.0, "gemm_a"),
+            named_kernel(3, 200.0, "relu"),
+            named_kernel(3, 300.0, "gemm_b"),
+            named_kernel(7, 150.0, "gemm_c"),
+            named_kernel(7, 250.0, "gemm_d"),
+        ])
+    }
+
+    fn selected_name(app: &App) -> String {
+        match app.selected_trace_item().unwrap() {
+            SelectedTraceItem::Kernel(k) => k.name.clone(),
+            SelectedTraceItem::Annotation(a) => a.name.clone(),
+        }
+    }
+
+    #[test]
+    fn test_search_collects_all_matches_and_jumps_to_first() {
+        let mut app = search_app();
+        app.search_start();
+        for c in "gemm".chars() {
+            app.search_push(c);
+        }
+        assert_eq!(app.search_matches.len(), 4, "four gemm_* matches");
+        assert_eq!(app.search_match_idx, 0);
+        assert_eq!(selected_name(&app), "gemm_a");
+        assert_eq!(app.search_match_label().as_deref(), Some("1/4"));
+    }
+
+    #[test]
+    fn test_search_next_advances_through_matches() {
+        let mut app = search_app();
+        app.search_start();
+        for c in "gemm".chars() {
+            app.search_push(c);
+        }
+        // Lane order: stream 3 lane (gemm_a, gemm_b), then stream 7 (gemm_c, gemm_d).
+        app.search_next();
+        assert_eq!(selected_name(&app), "gemm_b");
+        assert_eq!(app.search_match_label().as_deref(), Some("2/4"));
+        app.search_next();
+        assert_eq!(selected_name(&app), "gemm_c");
+        app.search_next();
+        assert_eq!(selected_name(&app), "gemm_d");
+        assert_eq!(app.search_match_label().as_deref(), Some("4/4"));
+    }
+
+    #[test]
+    fn test_search_next_wraps_to_first() {
+        let mut app = search_app();
+        app.search_start();
+        for c in "gemm".chars() {
+            app.search_push(c);
+        }
+        for _ in 0..3 {
+            app.search_next();
+        }
+        assert_eq!(selected_name(&app), "gemm_d"); // 4/4
+        app.search_next(); // wraps
+        assert_eq!(selected_name(&app), "gemm_a");
+        assert_eq!(app.search_match_label().as_deref(), Some("1/4"));
+    }
+
+    #[test]
+    fn test_search_prev_wraps_to_last() {
+        let mut app = search_app();
+        app.search_start();
+        for c in "gemm".chars() {
+            app.search_push(c);
+        }
+        // At first match; prev wraps to the last.
+        app.search_prev();
+        assert_eq!(selected_name(&app), "gemm_d");
+        assert_eq!(app.search_match_label().as_deref(), Some("4/4"));
+        app.search_prev();
+        assert_eq!(selected_name(&app), "gemm_c");
+    }
+
+    #[test]
+    fn test_search_next_prev_noop_without_matches() {
+        let mut app = search_app();
+        app.search_start();
+        for c in "zzz".chars() {
+            app.search_push(c);
+        }
+        assert!(app.search_no_match);
+        assert!(app.search_matches.is_empty());
+        assert!(app.search_match_label().is_none());
+        // No panic, no movement.
+        app.search_next();
+        app.search_prev();
+    }
+
+    #[test]
+    fn test_search_refine_resets_match_index() {
+        let mut app = search_app();
+        app.search_start();
+        for c in "gemm".chars() {
+            app.search_push(c);
+        }
+        app.search_next();
+        app.search_next();
+        assert_eq!(app.search_match_idx, 2);
+        // Refining the query rebuilds matches and jumps back to the first.
+        app.search_push('_');
+        app.search_push('c');
+        assert_eq!(app.search_matches.len(), 1);
+        assert_eq!(app.search_match_idx, 0);
+        assert_eq!(selected_name(&app), "gemm_c");
+    }
+
     #[test]
     fn test_kernel_columns_skips_out_of_window() {
         let ts_start = 1000.0;
@@ -1434,6 +2105,83 @@ mod tests {
             correlation: None,
             trace_id: 0,
         }
+    }
+
+    // ── Lane CSV export (E key) ──────────────────────────────────────────────
+
+    #[test]
+    fn test_csv_escape_quotes_commas_and_quotes() {
+        assert_eq!(csv_escape("plain"), "plain");
+        assert_eq!(csv_escape("[32,1,1]"), "\"[32,1,1]\"");
+        assert_eq!(csv_escape("a\"b"), "\"a\"\"b\"");
+        assert_eq!(csv_escape("line\nbreak"), "\"line\nbreak\"");
+    }
+
+    // S1 happy: active kernel lane -> header + one row per kernel, full fields,
+    // grid/block comma-quoted.
+    #[test]
+    fn test_lane_kernels_csv_happy() {
+        let mut k0 = kd(4, 100.0, "gemm", 30.0);
+        k0.device = 7;
+        k0.grid = Some("[32,1,1]".into());
+        k0.block = Some("[128,1,1]".into());
+        k0.shared_memory = Some(2048);
+        k0.registers_per_thread = Some(64);
+        k0.correlation = Some(999);
+        let app = app_from(vec![k0, kd(4, 200.0, "relu", 10.0)]);
+
+        let csv = app.lane_kernels_csv().expect("kernel lane produces CSV");
+        let lines: Vec<&str> = csv.lines().collect();
+        assert_eq!(
+            lines[0],
+            "idx,name,ts,dur,end_ts,stream,device,grid,block,shared_memory,registers_per_thread,correlation"
+        );
+        // Row 1: gemm with all fields; grid/block quoted (contain commas).
+        assert_eq!(
+            lines[1],
+            "1,gemm,100,30,130,4,7,\"[32,1,1]\",\"[128,1,1]\",2048,64,999"
+        );
+        // Row 2: relu with empty optional fields.
+        assert_eq!(lines[2], "2,relu,200,10,210,4,0,,,,,");
+        assert_eq!(lines.len(), 3, "header + 2 kernels");
+    }
+
+    // S2 edge: annotation lane -> None; empty is handled (header only).
+    #[test]
+    fn test_lane_kernels_csv_none_on_annotation_lane() {
+        let kernels = vec![named_kernel(4, 100.0, "k")];
+        let annotations = vec![AnnotationEvent {
+            name: "ctx".to_string(),
+            ts: 90.0,
+            dur: 20.0,
+            stream: 4,
+            trace_id: 0,
+        }];
+        let mut app = App::new(Trace {
+            kernels,
+            annotations,
+        });
+        let ann_lane = app.lanes.iter().position(|l| l.is_annotations()).unwrap();
+        app.active_lane = ann_lane;
+        assert!(
+            app.lane_kernels_csv().is_none(),
+            "annotation lane is not exportable"
+        );
+    }
+
+    #[test]
+    fn test_lane_csv_filename_single_and_multi_trace() {
+        let app = app_from(vec![kd(4, 0.0, "a", 1.0)]);
+        assert_eq!(app.lane_csv_filename(), "lane-cuda4.csv");
+
+        let t0 = trace_of(vec![kd(4, 0.0, "a", 1.0)], vec![]);
+        let t1 = trace_of(vec![kd(4, 0.0, "a", 1.0)], vec![]);
+        let app2 = App::new_multi(vec![("T0".into(), t0), ("T1".into(), t1)]);
+        assert!(
+            app2.lane_csv_filename().starts_with("lane-cuda4-trace"),
+            "multi-trace name carries the trace id: {}",
+            app2.lane_csv_filename()
+        );
     }
 
     // S1: sequence runs from current up to (not including) next same-named kernel.
@@ -1672,13 +2420,13 @@ mod tests {
         let _ = std::fs::remove_file(&outcome.file_path);
     }
 
-    // ── Multi-trace alignment + interleaving ─────────────────────────────────
+    // ── Multi-trace: interleaving, diff/normal modes, TimeMap ────────────────
 
-    fn ann(stream: u64, ts: f64, name: &str) -> AnnotationEvent {
+    fn ann_dur(stream: u64, ts: f64, dur: f64, name: &str) -> AnnotationEvent {
         AnnotationEvent {
             name: name.to_string(),
             ts,
-            dur: 1.0,
+            dur,
             stream,
             trace_id: 0,
         }
@@ -1691,49 +2439,7 @@ mod tests {
         }
     }
 
-    // S1: two traces share annotation "step" at different abs ts -> aligned
-    // render_ts of that annotation is equal across both traces.
-    #[test]
-    fn test_alignment_offsets_anchor_on_first_shared_annotation() {
-        let t0 = trace_of(vec![kd(1, 100.0, "foo", 5.0)], vec![ann(1, 100.0, "step")]);
-        let t1 = trace_of(vec![kd(1, 500.0, "foo", 5.0)], vec![ann(1, 500.0, "step")]);
-        let app = App::new_multi(vec![("T0".into(), t0), ("T1".into(), t1)]);
-
-        assert_eq!(app.traces.len(), 2);
-        assert_eq!(app.traces[0].offset_us, 0.0, "reference trace offset is 0");
-        assert_eq!(app.traces[1].offset_us, -400.0, "shift t1 back by 400");
-        assert_eq!(app.traces[0].anchor.as_deref(), Some("step"));
-
-        // Aligned anchor timestamps coincide.
-        let a0 = app
-            .annotations
-            .iter()
-            .find(|a| a.trace_id == 0 && a.name == "step")
-            .unwrap();
-        let a1 = app
-            .annotations
-            .iter()
-            .find(|a| a.trace_id == 1 && a.name == "step")
-            .unwrap();
-        let r0 = a0.ts + app.traces[0].offset_us;
-        let r1 = a1.ts + app.traces[1].offset_us;
-        assert!((r0 - r1).abs() < 1e-9, "anchor aligned: {} vs {}", r0, r1);
-    }
-
-    // S1b: the render-ts accessors add the per-trace offset to raw ts.
-    #[test]
-    fn test_render_ts_accessors_apply_offset() {
-        let t0 = trace_of(vec![kd(1, 100.0, "foo", 5.0)], vec![ann(1, 100.0, "step")]);
-        let t1 = trace_of(vec![kd(1, 500.0, "bar", 7.0)], vec![ann(1, 500.0, "step")]);
-        let app = App::new_multi(vec![("T0".into(), t0), ("T1".into(), t1)]);
-
-        let k1 = app.kernels.iter().position(|k| k.trace_id == 1).unwrap();
-        // raw 500 + offset -400 = 100
-        assert!((app.kernel_render_ts(k1) - 100.0).abs() < 1e-9);
-        assert!((app.kernel_render_end(k1) - 107.0).abs() < 1e-9);
-    }
-
-    // S2: interleave order = row0 of every trace, then row1, etc. with correct
+    // Interleave order = row0 of every trace, then row1, etc. with correct
     // trace_id per lane.
     #[test]
     fn test_lanes_interleaved_by_row_across_traces() {
@@ -1755,28 +2461,7 @@ mod tests {
         assert_eq!(app.lanes[3].stream_id(), 2);
     }
 
-    // S3: no shared annotation name -> all offsets 0, lanes still interleaved.
-    #[test]
-    fn test_no_common_annotation_falls_back_to_zero_offset() {
-        let t0 = trace_of(vec![kd(1, 100.0, "a", 1.0)], vec![ann(1, 100.0, "alpha")]);
-        let t1 = trace_of(vec![kd(1, 500.0, "b", 1.0)], vec![ann(1, 500.0, "beta")]);
-        let app = App::new_multi(vec![("T0".into(), t0), ("T1".into(), t1)]);
-
-        assert_eq!(app.traces[0].offset_us, 0.0);
-        assert_eq!(app.traces[1].offset_us, 0.0);
-        assert!(app.traces[0].anchor.is_none(), "no anchor chosen");
-        // Each trace: annotation lane + kernel lane = 2 lanes; interleaved = 4,
-        // in [t0.ann, t1.ann, t0.kern, t1.kern] order.
-        assert_eq!(app.lanes.len(), 4, "still interleaved by row across traces");
-        assert_eq!(app.lanes[0].trace_id(), 0);
-        assert_eq!(app.lanes[1].trace_id(), 1);
-        assert!(app.lanes[0].is_annotations());
-        assert!(app.lanes[1].is_annotations());
-        assert!(!app.lanes[2].is_annotations());
-        assert!(!app.lanes[3].is_annotations());
-    }
-
-    // S4: unequal lane counts -> round-robin to max, skip missing rows.
+    // Unequal lane counts -> round-robin to max, skip missing rows.
     #[test]
     fn test_unequal_lane_counts_round_robin_skips_missing() {
         // t0: 3 streams -> 3 lanes. t1: 1 stream -> 1 lane.
@@ -1799,64 +2484,57 @@ mod tests {
         assert_eq!(app.lanes[3].trace_id(), 0);
     }
 
-    // S5 regression: single-trace App::new behaves as before (offset 0, 1 trace).
+    // Accessors read the (always-populated) override vectors, not a scalar
+    // offset. Two traces default to diff mode: t1.foo snaps onto t0.foo start.
     #[test]
-    fn test_single_trace_regression_offsets_and_lanes() {
+    fn test_render_ts_accessors_read_overrides() {
+        let t0 = trace_of(vec![kd(1, 100.0, "foo", 5.0)], vec![]);
+        let t1 = trace_of(vec![kd(1, 500.0, "foo", 7.0)], vec![]);
+        let app = App::new_multi(vec![("T0".into(), t0), ("T1".into(), t1)]);
+
+        let k1 = app.kernels.iter().position(|k| k.trace_id == 1).unwrap();
+        // Diff snap: start == anchor start (zero-based to global min 100).
+        assert!((app.kernel_render_ts(k1) - 100.0).abs() < 1e-9);
+        // t1 keeps its own duration 7 -> end 107.
+        assert!((app.kernel_render_end(k1) - 107.0).abs() < 1e-9);
+    }
+
+    // Single trace zero-bases to identity (its own min), G is a no-op, no mode.
+    #[test]
+    fn test_single_trace_regression() {
         let app = app_with_annotations();
         assert_eq!(app.traces.len(), 1);
-        assert_eq!(app.traces[0].offset_us, 0.0);
-        // Same lane layout as before: annotation lane + kernel lane for stream 4.
+        // Zero-base of one trace is identity: earliest event stays put.
+        let k0 = app.kernels.iter().position(|k| k.name == "kernel_a").unwrap();
+        assert!((app.kernel_render_ts(k0) - 100.0).abs() < 1e-9);
         assert_eq!(app.lanes.len(), 2);
         assert!(app.lanes.iter().all(|l| l.trace_id() == 0));
     }
 
-    // S1c: global_time_bounds spans the ALIGNED window across traces, so the far
-    // trace's shifted events fall inside the reference trace's coordinate range.
+    // global_time_bounds flows through the overridden accessors: in diff mode two
+    // traces with matched kernels collapse to a compact aligned window.
     #[test]
-    fn test_global_bounds_use_aligned_timestamps() {
-        // t0 anchor "step" at 100; t1 anchor at 500 -> offset -400.
-        // t1 kernel raw 500 -> aligned 100, so aligned max end ~ 105, not 505.
-        let t0 = trace_of(vec![kd(1, 100.0, "foo", 5.0)], vec![ann(1, 100.0, "step")]);
-        let t1 = trace_of(vec![kd(1, 500.0, "bar", 5.0)], vec![ann(1, 500.0, "step")]);
+    fn test_global_bounds_use_override_positions() {
+        let t0 = trace_of(vec![kd(1, 100.0, "foo", 5.0)], vec![]);
+        let t1 = trace_of(vec![kd(1, 500.0, "foo", 5.0)], vec![]);
         let app = App::new_multi(vec![("T0".into(), t0), ("T1".into(), t1)]);
         let (g_start, g_end) = app.global_time_bounds();
-        // Both traces' aligned events sit near ts=100..105.
+        // Both traces' events sit near ts=100..105 (zero-based + diff-snapped).
         assert!((g_start - 100.0).abs() < 1e-9, "start {}", g_start);
-        assert!(g_end <= 106.0, "aligned end should be ~105 not 505, got {}", g_end);
+        assert!(g_end <= 106.0, "aligned end ~105 not 505, got {}", g_end);
     }
 
-    // Alignment label surfaces the chosen anchor for multi-trace, empty otherwise.
-    #[test]
-    fn test_alignment_label_reports_anchor() {
-        let t0 = trace_of(vec![kd(1, 100.0, "foo", 5.0)], vec![ann(1, 100.0, "step")]);
-        let t1 = trace_of(vec![kd(1, 500.0, "bar", 5.0)], vec![ann(1, 500.0, "step")]);
-        let app = App::new_multi(vec![("T0".into(), t0), ("T1".into(), t1)]);
-        assert_eq!(app.alignment_label().as_deref(), Some("aligned on \"step\""));
-
-        let single = app_with_annotations();
-        assert!(single.alignment_label().is_none(), "single trace: no label");
-
-        let d0 = trace_of(vec![kd(1, 1.0, "a", 1.0)], vec![ann(1, 1.0, "x")]);
-        let d1 = trace_of(vec![kd(1, 9.0, "b", 1.0)], vec![ann(1, 9.0, "y")]);
-        let disjoint = App::new_multi(vec![("T0".into(), d0), ("T1".into(), d1)]);
-        assert_eq!(
-            disjoint.alignment_label().as_deref(),
-            Some("not aligned (no shared annotation)")
-        );
-    }
-
-    // Tabbing across offset traces lands on the ALIGNED-nearest item, so the
-    // visually-adjacent kernel is selected (this feature is for visual compare).
+    // Tabbing across diff-aligned traces lands on the aligned-nearest item; with
+    // matched kernels snapped, selecting t0.bar and tabbing to t1 lands on t1.bar.
     #[test]
     fn test_tab_across_traces_uses_aligned_position() {
-        // t0: foo@100, bar@200 (anchor@100). t1: foo@9100->200, bar@9200->300 (anchor@9000).
         let t0 = trace_of(
             vec![kd(1, 100.0, "foo", 5.0), kd(1, 200.0, "bar", 5.0)],
-            vec![ann(1, 100.0, "step")],
+            vec![],
         );
         let t1 = trace_of(
             vec![kd(1, 9100.0, "foo", 5.0), kd(1, 9200.0, "bar", 5.0)],
-            vec![ann(1, 9000.0, "step")],
+            vec![],
         );
         let mut app = App::new_multi(vec![("T0".into(), t0), ("T1".into(), t1)]);
 
@@ -1887,123 +2565,751 @@ mod tests {
         app.move_to_lane_for_test(t1_kern_lane);
         let sel = app.selected_trace_item().unwrap();
         match sel {
-            // Aligned-nearest to 200 is t1.foo (aligned 200), not t1.bar (aligned 300).
-            SelectedTraceItem::Kernel(k) => assert_eq!(k.name, "foo"),
+            // t1.bar is snapped onto t0.bar (aligned 200) -> it is the nearest.
+            SelectedTraceItem::Kernel(k) => assert_eq!(k.name, "bar"),
             _ => panic!("expected kernel"),
         }
     }
 
-    // ── Dynamic align to the selected kernel (g key) ─────────────────────────
+    // ── Two-trace kernel-diff alignment (default mode) ───────────────────────
 
-    /// Aligned start ts of trace `tid`'s nearest same-named kernel to `target`.
-    fn nearest_same_name_aligned(app: &App, tid: usize, name: &str, target: f64) -> Option<f64> {
+    /// Flat kernel index of trace `tid`'s kernel named `name` at raw ts `ts`.
+    fn kidx(app: &App, tid: usize, name: &str, ts: f64) -> usize {
         app.kernels
             .iter()
-            .enumerate()
-            .filter(|(_, k)| k.trace_id == tid && k.name == name)
-            .map(|(i, _)| app.kernel_render_ts(i))
-            .min_by(|a, b| {
-                (a - target)
-                    .abs()
-                    .partial_cmp(&(b - target).abs())
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            })
+            .position(|k| k.trace_id == tid && k.name == name && (k.ts - ts).abs() < 1e-9)
+            .unwrap_or_else(|| panic!("kernel {name}@{ts} (trace {tid}) not found"))
     }
 
-    fn select_kernel(app: &mut App, tid: usize, name: &str) {
-        let lane = app
-            .lanes
+    fn aidx(app: &App, tid: usize, name: &str) -> usize {
+        app.annotations
             .iter()
-            .position(|l| {
-                l.trace_id() == tid
-                    && !l.is_annotations()
-                    && l.item_indices().iter().any(|&i| app.kernels[i].name == name)
-            })
-            .unwrap();
-        let pos = app.lanes[lane]
-            .item_indices()
-            .iter()
-            .position(|&i| app.kernels[i].name == name)
-            .unwrap();
-        app.active_lane = lane;
-        app.selected_item = pos;
+            .position(|a| a.trace_id == tid && a.name == name)
+            .unwrap_or_else(|| panic!("annotation {name} (trace {tid}) not found"))
     }
 
-    // S1: aligning to a selected kernel shifts other traces so their nearest
-    // same-named kernel's start coincides with the selected kernel's start.
+    // Diff S1: identical name sequence, differing durations. Trace-1 starts snap
+    // onto trace-0 starts; each trace keeps its own duration (ends differ).
     #[test]
-    fn test_align_to_selected_kernel_shifts_others() {
-        // No shared annotation -> load offsets are 0; both traces raw.
-        // t0: gemm@200. t1: gemm@700. Selecting t0.gemm and aligning moves t1
-        // so t1.gemm aligned start == 200.
-        let t0 = trace_of(vec![kd(1, 200.0, "gemm", 8.0)], vec![]);
-        let t1 = trace_of(vec![kd(1, 700.0, "gemm", 8.0)], vec![]);
-        let mut app = App::new_multi(vec![("T0".into(), t0), ("T1".into(), t1)]);
-        assert_eq!(app.traces[1].offset_us, 0.0, "no annotation -> load offset 0");
+    fn test_diff_align_s1_equal_snaps_start_keeps_own_duration() {
+        let t0 = trace_of(
+            vec![kd(1, 100.0, "a", 10.0), kd(1, 200.0, "b", 10.0)],
+            vec![],
+        );
+        let t1 = trace_of(
+            vec![kd(1, 5100.0, "a", 40.0), kd(1, 5200.0, "b", 40.0)],
+            vec![],
+        );
+        let app = App::new_multi(vec![("T0".into(), t0), ("T1".into(), t1)]);
 
-        select_kernel(&mut app, 0, "gemm");
-        let ok = app.align_to_selected_kernel();
-        assert!(ok, "align succeeds on a selected kernel");
+        let a0 = kidx(&app, 0, "a", 100.0);
+        let a1 = kidx(&app, 1, "a", 5100.0);
+        let b0 = kidx(&app, 0, "b", 200.0);
+        let b1 = kidx(&app, 1, "b", 5200.0);
 
-        // Selected trace unchanged; t1 shifted so its gemm sits at 200.
-        assert_eq!(app.traces[0].offset_us, 0.0, "selected/reference trace fixed");
-        assert_eq!(app.traces[1].offset_us, -500.0, "t1 shifts by 200-700");
-        let t1_gemm = app.kernels.iter().position(|k| k.trace_id == 1).unwrap();
-        assert!((app.kernel_render_ts(t1_gemm) - 200.0).abs() < 1e-9);
-        // Header anchor reflects the kernel used.
-        assert_eq!(app.alignment_label().as_deref(), Some("aligned on \"gemm\""));
-        let _ = nearest_same_name_aligned(&app, 1, "gemm", 200.0);
+        assert!((app.kernel_render_ts(a1) - app.kernel_render_ts(a0)).abs() < 1e-9);
+        assert!((app.kernel_render_ts(b1) - app.kernel_render_ts(b0)).abs() < 1e-9);
+        // Anchor keeps its zero-based position (global min 100) and own duration.
+        assert!((app.kernel_render_ts(a0) - 100.0).abs() < 1e-9);
+        assert!((app.kernel_render_end(a0) - 110.0).abs() < 1e-9);
+        // Trace 1 keeps its own (longer) duration -> ends differ.
+        assert!((app.kernel_render_end(a1) - 140.0).abs() < 1e-9);
+        assert!(app.kernel_render_end(a1) != app.kernel_render_end(a0));
     }
 
-    // S2: when a trace has multiple same-named kernels, align picks the one
-    // whose aligned start is NEAREST to the selected kernel, not the first.
+    // Diff S2: middle Insert. Trace-1-only "x" fills a gap before the next anchor
+    // kernel; later anchor kernels shift right by the inserted run's span.
     #[test]
-    fn test_align_picks_nearest_same_named_kernel() {
-        // t0: bar@500 selected. t1 has gemm@100, bar@480, bar@900.
-        // Nearest bar to 500 is 480 -> shift by 500-480 = +20.
-        let t0 = trace_of(vec![kd(1, 500.0, "bar", 5.0)], vec![]);
+    fn test_diff_align_s2_middle_insert_shifts_later_anchor() {
+        let t0 = trace_of(
+            vec![kd(1, 100.0, "a", 10.0), kd(1, 200.0, "b", 10.0)],
+            vec![],
+        );
         let t1 = trace_of(
             vec![
-                kd(1, 100.0, "gemm", 5.0),
-                kd(1, 480.0, "bar", 5.0),
-                kd(1, 900.0, "bar", 5.0),
+                kd(1, 100.0, "a", 10.0),
+                kd(1, 130.0, "x", 25.0),
+                kd(1, 200.0, "b", 10.0),
             ],
             vec![],
         );
-        let mut app = App::new_multi(vec![("T0".into(), t0), ("T1".into(), t1)]);
-        select_kernel(&mut app, 0, "bar");
-        assert!(app.align_to_selected_kernel());
-        assert_eq!(app.traces[1].offset_us, 20.0, "nearest bar (480) -> +20");
+        let app = App::new_multi(vec![("T0".into(), t0), ("T1".into(), t1)]);
+
+        let a0 = kidx(&app, 0, "a", 100.0);
+        let b0 = kidx(&app, 0, "b", 200.0);
+        let x1 = kidx(&app, 1, "x", 130.0);
+
+        // "a" unchanged at anchor origin.
+        assert!((app.kernel_render_ts(a0) - 100.0).abs() < 1e-9);
+        // Insert span = single kernel dur = 25 -> "b" shifts 200 -> 225.
+        assert!(
+            (app.kernel_render_ts(b0) - 225.0).abs() < 1e-9,
+            "b shifted by insert span, got {}",
+            app.kernel_render_ts(b0)
+        );
+        // "x" fills the inserted gap [200,225); "b" is pushed past it to 225.
+        assert!(
+            (app.kernel_render_ts(x1) - 200.0).abs() < 1e-9,
+            "x at gap start, got {}",
+            app.kernel_render_ts(x1)
+        );
+        assert!((app.kernel_render_end(x1) - app.kernel_render_ts(b0)).abs() < 1e-9);
     }
 
-    // S3: aligning when another trace has NO same-named kernel leaves that trace
-    // untouched (no panic, offset unchanged).
+    // Diff S5: Delete. Trace-0-only kernel keeps anchor position; trace 1 has no
+    // kernel mapped there; surrounding matches stay aligned.
     #[test]
-    fn test_align_no_match_leaves_trace_untouched() {
-        let t0 = trace_of(vec![kd(1, 200.0, "gemm", 5.0)], vec![]);
-        let t1 = trace_of(vec![kd(1, 700.0, "relu", 5.0)], vec![]);
-        let mut app = App::new_multi(vec![("T0".into(), t0), ("T1".into(), t1)]);
-        select_kernel(&mut app, 0, "gemm");
-        assert!(app.align_to_selected_kernel());
-        assert_eq!(app.traces[1].offset_us, 0.0, "no 'gemm' in t1 -> unchanged");
+    fn test_diff_align_s5_delete_keeps_anchor_only() {
+        let t0 = trace_of(
+            vec![
+                kd(1, 100.0, "a", 10.0),
+                kd(1, 200.0, "gone", 10.0),
+                kd(1, 300.0, "b", 10.0),
+            ],
+            vec![],
+        );
+        let t1 = trace_of(
+            vec![kd(1, 100.0, "a", 10.0), kd(1, 300.0, "b", 10.0)],
+            vec![],
+        );
+        let app = App::new_multi(vec![("T0".into(), t0), ("T1".into(), t1)]);
+
+        let gone0 = kidx(&app, 0, "gone", 200.0);
+        let b0 = kidx(&app, 0, "b", 300.0);
+        let b1 = kidx(&app, 1, "b", 300.0);
+
+        assert!((app.kernel_render_ts(gone0) - 200.0).abs() < 1e-9);
+        assert!((app.kernel_render_ts(b0) - 300.0).abs() < 1e-9);
+        assert!((app.kernel_render_ts(b1) - 300.0).abs() < 1e-9);
     }
 
-    // S4: aligning with an annotation (non-kernel) selected is a no-op.
+    // Diff Replace = Delete(old) + Insert(new): anchor-only old kernel stays put,
+    // new trace-1 kernel fills the inserted gap, later anchors shift by its span.
     #[test]
-    fn test_align_noop_when_selection_not_kernel() {
-        let t0 = trace_of(vec![kd(1, 100.0, "k", 5.0)], vec![ann(1, 90.0, "ctx")]);
-        let t1 = trace_of(vec![kd(1, 900.0, "k", 5.0)], vec![ann(1, 800.0, "ctx")]);
+    fn test_diff_align_replace_is_delete_plus_insert() {
+        let t0 = trace_of(
+            vec![
+                kd(1, 100.0, "a", 10.0),
+                kd(1, 200.0, "old", 10.0),
+                kd(1, 300.0, "b", 10.0),
+            ],
+            vec![],
+        );
+        let t1 = trace_of(
+            vec![
+                kd(1, 100.0, "a", 10.0),
+                kd(1, 200.0, "new", 40.0),
+                kd(1, 300.0, "b", 10.0),
+            ],
+            vec![],
+        );
+        let app = App::new_multi(vec![("T0".into(), t0), ("T1".into(), t1)]);
+
+        let old0 = kidx(&app, 0, "old", 200.0);
+        let new1 = kidx(&app, 1, "new", 200.0);
+        let b0 = kidx(&app, 0, "b", 300.0);
+
+        assert!((app.kernel_render_ts(old0) - 200.0).abs() < 1e-9);
+        // "new" span 40 -> "b" 300 -> 340; "new" fills gap [300,340).
+        assert!(
+            (app.kernel_render_ts(b0) - 340.0).abs() < 1e-9,
+            "b shifted by new span, got {}",
+            app.kernel_render_ts(b0)
+        );
+        assert!(
+            (app.kernel_render_ts(new1) - 300.0).abs() < 1e-9,
+            "new at gap start, got {}",
+            app.kernel_render_ts(new1)
+        );
+        assert!((app.kernel_render_end(new1) - app.kernel_render_ts(b0)).abs() < 1e-9);
+    }
+
+    // ── New diff/normal-mode contract (S1–S8) ────────────────────────────────
+
+    // S1: diff mode remaps an annotation via the per-stream TimeMap: its start
+    // snaps to the anchor and its end stays >= start (monotonic).
+    #[test]
+    fn test_mode_s1_diff_remaps_annotation_via_timemap() {
+        // Shared stream 1: t0 [a@100, b@200]; t1 [a@100, x@130 (insert), b@200].
+        // Annotation "ctx" on t0 spans [a..b]; on t1 spans over the inserted x.
+        let t0 = trace_of(
+            vec![kd(1, 100.0, "a", 10.0), kd(1, 200.0, "b", 10.0)],
+            vec![ann_dur(1, 100.0, 100.0, "ctx")],
+        );
+        let t1 = trace_of(
+            vec![
+                kd(1, 100.0, "a", 10.0),
+                kd(1, 130.0, "x", 25.0),
+                kd(1, 200.0, "b", 10.0),
+            ],
+            vec![ann_dur(1, 100.0, 100.0, "ctx")],
+        );
+        let app = App::new_multi(vec![("T0".into(), t0), ("T1".into(), t1)]);
+        assert_eq!(app.align_mode, AlignMode::Diff);
+
+        // t1 kernels: a@100, x fills [200,225), b@225 (shifted by span 25).
+        let b0 = kidx(&app, 0, "b", 200.0);
+        assert!((app.kernel_render_ts(b0) - 225.0).abs() < 1e-9);
+
+        // t1 "ctx" raw [100,200] maps through controls a:(100->100), b:(200->225):
+        // start=100, end interpolates to 225 (b's render). end >= start.
+        let c1 = aidx(&app, 1, "ctx");
+        assert!((app.annotation_render_ts(c1) - 100.0).abs() < 1e-9);
+        assert!(
+            (app.annotation_render_end(c1) - 225.0).abs() < 1e-9,
+            "ctx end remapped through TimeMap, got {}",
+            app.annotation_render_end(c1)
+        );
+        assert!(app.annotation_render_end(c1) >= app.annotation_render_ts(c1));
+    }
+
+    // S2: normal mode zero-bases every trace to the common start; both traces'
+    // earliest events coincide. Applies for >2 traces and the 2-trace toggle.
+    #[test]
+    fn test_mode_s2_normal_zero_base() {
+        // Three traces at wildly different absolute ts -> all earliest coincide.
+        let t0 = trace_of(vec![kd(1, 1000.0, "a", 5.0)], vec![]);
+        let t1 = trace_of(vec![kd(1, 5000.0, "b", 5.0)], vec![]);
+        let t2 = trace_of(vec![kd(1, 9000.0, "c", 5.0)], vec![]);
+        let app =
+            App::new_multi(vec![("T0".into(), t0), ("T1".into(), t1), ("T2".into(), t2)]);
+        let a = kidx(&app, 0, "a", 1000.0);
+        let b = kidx(&app, 1, "b", 5000.0);
+        let c = kidx(&app, 2, "c", 9000.0);
+        // global_min = 1000 -> a stays 1000, b/c shift to 1000 too.
+        assert!((app.kernel_render_ts(a) - 1000.0).abs() < 1e-9);
+        assert!((app.kernel_render_ts(b) - 1000.0).abs() < 1e-9);
+        assert!((app.kernel_render_ts(c) - 1000.0).abs() < 1e-9);
+
+        // 2-trace normal toggle: same zero-base rule.
+        let u0 = trace_of(vec![kd(1, 1000.0, "a", 5.0)], vec![]);
+        let u1 = trace_of(vec![kd(1, 5000.0, "z", 5.0)], vec![]);
+        let mut app2 = App::new_multi(vec![("T0".into(), u0), ("T1".into(), u1)]);
+        assert!(app2.toggle_align_mode());
+        assert_eq!(app2.align_mode, AlignMode::Normal);
+        let za = kidx(&app2, 0, "a", 1000.0);
+        let zz = kidx(&app2, 1, "z", 5000.0);
+        assert!((app2.kernel_render_ts(za) - 1000.0).abs() < 1e-9);
+        assert!((app2.kernel_render_ts(zz) - 1000.0).abs() < 1e-9);
+    }
+
+    // S3: Diff -> Normal -> Diff returns identical kernel + annotation overrides.
+    #[test]
+    fn test_mode_s3_toggle_idempotency() {
+        let t0 = trace_of(
+            vec![kd(1, 100.0, "a", 10.0), kd(1, 200.0, "b", 10.0)],
+            vec![ann_dur(1, 100.0, 100.0, "ctx")],
+        );
+        let t1 = trace_of(
+            vec![
+                kd(1, 100.0, "a", 10.0),
+                kd(1, 130.0, "x", 25.0),
+                kd(1, 200.0, "b", 10.0),
+            ],
+            vec![ann_dur(1, 100.0, 120.0, "ctx")],
+        );
         let mut app = App::new_multi(vec![("T0".into(), t0), ("T1".into(), t1)]);
-        let load_offset = app.traces[1].offset_us;
-        // Select the annotation lane.
-        let ann_lane = app.lanes.iter().position(|l| l.is_annotations()).unwrap();
-        app.active_lane = ann_lane;
-        app.selected_item = 0;
-        assert!(!app.align_to_selected_kernel(), "no-op on annotation");
-        assert_eq!(app.traces[1].offset_us, load_offset, "offsets unchanged");
+        let k_before = app.kernel_render_overrides.clone();
+        let a_before = app.annotation_render_overrides.clone();
+
+        assert!(app.toggle_align_mode());
+        assert!(app.toggle_align_mode());
+        assert_eq!(app.align_mode, AlignMode::Diff);
+        assert_eq!(app.kernel_render_overrides, k_before, "kernels restored");
+        assert_eq!(
+            app.annotation_render_overrides, a_before,
+            "annotations restored"
+        );
+    }
+
+    // S4: an annotation-only stream (no kernels) uses normal mapping in both modes.
+    #[test]
+    fn test_mode_s4_annotation_only_stream_normal_in_both_modes() {
+        // Stream 1 has kernels in both traces (drives diff); stream 9 is
+        // annotation-only in t1. global_min = 100.
+        let t0 = trace_of(vec![kd(1, 100.0, "a", 10.0)], vec![]);
+        let t1 = trace_of(
+            vec![kd(1, 100.0, "a", 10.0)],
+            vec![ann_dur(9, 400.0, 10.0, "solo")],
+        );
+        let app = App::new_multi(vec![("T0".into(), t0), ("T1".into(), t1)]);
+        let s = aidx(&app, 1, "solo");
+        // Normal offset for t1 = global_min(100) - trace1_min(100) = 0 -> raw.
+        assert!((app.annotation_render_ts(s) - 400.0).abs() < 1e-9);
+        assert!((app.annotation_render_end(s) - 410.0).abs() < 1e-9);
+    }
+
+    // S5: a stream present in only one trace uses normal mapping (no diff shift).
+    #[test]
+    fn test_mode_s5_one_sided_stream_normal() {
+        // Stream 2 only exists in t0. global_min = 100 -> t0 offset 0.
+        let t0 = trace_of(
+            vec![kd(1, 100.0, "a", 10.0), kd(2, 300.0, "solo", 10.0)],
+            vec![],
+        );
+        let t1 = trace_of(vec![kd(1, 100.0, "a", 10.0)], vec![]);
+        let app = App::new_multi(vec![("T0".into(), t0), ("T1".into(), t1)]);
+        let s = kidx(&app, 0, "solo", 300.0);
+        assert!((app.kernel_render_ts(s) - 300.0).abs() < 1e-9, "one-sided raw");
+    }
+
+    // S6: single trace zero-bases to identity, G is a no-op, no mode label.
+    #[test]
+    fn test_mode_s6_single_trace() {
+        let mut app = app_from(vec![kd(1, 100.0, "a", 10.0), kd(1, 200.0, "b", 10.0)]);
+        let a = kidx(&app, 0, "a", 100.0);
+        let b = kidx(&app, 0, "b", 200.0);
+        assert!((app.kernel_render_ts(a) - 100.0).abs() < 1e-9);
+        assert!((app.kernel_render_ts(b) - 200.0).abs() < 1e-9);
+        assert!(!app.toggle_align_mode(), "G no-op for single trace");
+        assert!(app.mode_label().is_none());
+    }
+
+    // S7: >2 traces -> G is a no-op and layout stays normal (no diff snapping).
+    #[test]
+    fn test_mode_s7_g_noop_for_more_than_two() {
+        let t0 = trace_of(vec![kd(1, 100.0, "a", 10.0)], vec![]);
+        let t1 = trace_of(vec![kd(1, 500.0, "a", 10.0)], vec![]);
+        let t2 = trace_of(vec![kd(1, 900.0, "a", 10.0)], vec![]);
+        let mut app =
+            App::new_multi(vec![("T0".into(), t0), ("T1".into(), t1), ("T2".into(), t2)]);
+        let before = app.kernel_render_overrides.clone();
+        assert!(!app.toggle_align_mode(), "G no-op for 3 traces");
+        assert_eq!(app.kernel_render_overrides, before, "layout unchanged");
+        // Normal zero-base: all "a" coincide at global_min 100 (no diff snap).
+        let a1 = kidx(&app, 1, "a", 500.0);
+        assert!((app.kernel_render_ts(a1) - 100.0).abs() < 1e-9);
+    }
+
+    // S8: mode_label is Some("diff")/Some("normal") for 2 traces (flips on
+    // toggle) and None for 1 and 3 traces.
+    #[test]
+    fn test_mode_s8_header_label() {
+        let t0 = trace_of(vec![kd(1, 100.0, "a", 10.0)], vec![]);
+        let t1 = trace_of(vec![kd(1, 200.0, "a", 10.0)], vec![]);
+        let mut app = App::new_multi(vec![("T0".into(), t0), ("T1".into(), t1)]);
+        assert_eq!(app.mode_label().as_deref(), Some("diff"));
+        assert!(app.toggle_align_mode());
+        assert_eq!(app.mode_label().as_deref(), Some("normal"));
+        assert!(app.toggle_align_mode());
+        assert_eq!(app.mode_label().as_deref(), Some("diff"));
+
+        let single = app_from(vec![kd(1, 0.0, "a", 1.0)]);
+        assert!(single.mode_label().is_none());
+
+        let u0 = trace_of(vec![kd(1, 0.0, "a", 1.0)], vec![]);
+        let u1 = trace_of(vec![kd(1, 0.0, "b", 1.0)], vec![]);
+        let u2 = trace_of(vec![kd(1, 0.0, "c", 1.0)], vec![]);
+        let three =
+            App::new_multi(vec![("T0".into(), u0), ("T1".into(), u1), ("T2".into(), u2)]);
+        assert!(three.mode_label().is_none());
+    }
+
+    // Every event has a populated override after construction (invariant).
+    #[test]
+    fn test_overrides_fully_populated() {
+        let t0 = trace_of(
+            vec![kd(1, 100.0, "a", 10.0)],
+            vec![ann_dur(1, 100.0, 20.0, "ctx")],
+        );
+        let t1 = trace_of(
+            vec![kd(1, 100.0, "a", 10.0), kd(1, 130.0, "x", 10.0)],
+            vec![ann_dur(1, 100.0, 40.0, "ctx")],
+        );
+        let app = App::new_multi(vec![("T0".into(), t0), ("T1".into(), t1)]);
+        assert!(app.kernel_render_overrides.iter().all(|o| o.is_some()));
+        assert!(app.annotation_render_overrides.iter().all(|o| o.is_some()));
+    }
+
+    // ── Diff status: added / deleted / matched ───────────────────────────────
+
+    // Insert -> trace-1-only kernel is Added; matched kernels carry no status.
+    #[test]
+    fn test_diff_status_insert_is_added() {
+        let t0 = trace_of(
+            vec![kd(1, 100.0, "a", 10.0), kd(1, 200.0, "b", 10.0)],
+            vec![],
+        );
+        let t1 = trace_of(
+            vec![
+                kd(1, 100.0, "a", 10.0),
+                kd(1, 130.0, "x", 25.0),
+                kd(1, 200.0, "b", 10.0),
+            ],
+            vec![],
+        );
+        let app = App::new_multi(vec![("T0".into(), t0), ("T1".into(), t1)]);
+        let x1 = kidx(&app, 1, "x", 130.0);
+        let a1 = kidx(&app, 1, "a", 100.0);
+        let a0 = kidx(&app, 0, "a", 100.0);
+        assert_eq!(app.kernel_diff(x1), Some(KernelDiff::Added));
+        assert_eq!(app.kernel_diff(a1), None, "matched kernel has no status");
+        assert_eq!(app.kernel_diff(a0), None);
+    }
+
+    // Delete -> trace-0-only kernel is Deleted.
+    #[test]
+    fn test_diff_status_delete_is_deleted() {
+        let t0 = trace_of(
+            vec![
+                kd(1, 100.0, "a", 10.0),
+                kd(1, 200.0, "gone", 10.0),
+                kd(1, 300.0, "b", 10.0),
+            ],
+            vec![],
+        );
+        let t1 = trace_of(
+            vec![kd(1, 100.0, "a", 10.0), kd(1, 300.0, "b", 10.0)],
+            vec![],
+        );
+        let app = App::new_multi(vec![("T0".into(), t0), ("T1".into(), t1)]);
+        let gone0 = kidx(&app, 0, "gone", 200.0);
+        assert_eq!(app.kernel_diff(gone0), Some(KernelDiff::Deleted));
+    }
+
+    // Replace -> old kernel Deleted, new kernel Added.
+    #[test]
+    fn test_diff_status_replace_marks_both() {
+        let t0 = trace_of(
+            vec![
+                kd(1, 100.0, "a", 10.0),
+                kd(1, 200.0, "old", 10.0),
+                kd(1, 300.0, "b", 10.0),
+            ],
+            vec![],
+        );
+        let t1 = trace_of(
+            vec![
+                kd(1, 100.0, "a", 10.0),
+                kd(1, 200.0, "new", 40.0),
+                kd(1, 300.0, "b", 10.0),
+            ],
+            vec![],
+        );
+        let app = App::new_multi(vec![("T0".into(), t0), ("T1".into(), t1)]);
+        let old0 = kidx(&app, 0, "old", 200.0);
+        let new1 = kidx(&app, 1, "new", 200.0);
+        assert_eq!(app.kernel_diff(old0), Some(KernelDiff::Deleted));
+        assert_eq!(app.kernel_diff(new1), Some(KernelDiff::Added));
+    }
+
+    // Normal mode clears all diff status; toggling back restores it.
+    #[test]
+    fn test_diff_status_cleared_in_normal_mode() {
+        let t0 = trace_of(vec![kd(1, 100.0, "a", 10.0)], vec![]);
+        let t1 = trace_of(
+            vec![kd(1, 100.0, "a", 10.0), kd(1, 130.0, "x", 10.0)],
+            vec![],
+        );
+        let mut app = App::new_multi(vec![("T0".into(), t0), ("T1".into(), t1)]);
+        let x1 = kidx(&app, 1, "x", 130.0);
+        assert_eq!(app.kernel_diff(x1), Some(KernelDiff::Added));
+
+        assert!(app.toggle_align_mode());
+        assert!(app.kernel_diff_status.iter().all(|s| s.is_none()), "normal clears status");
+
+        assert!(app.toggle_align_mode());
+        assert_eq!(app.kernel_diff(x1), Some(KernelDiff::Added), "diff restores status");
+    }
+
+    // No diff status for >2 traces (no diff runs).
+    #[test]
+    fn test_diff_status_none_for_more_than_two_traces() {
+        let t0 = trace_of(vec![kd(1, 100.0, "a", 10.0)], vec![]);
+        let t1 = trace_of(vec![kd(1, 100.0, "a", 10.0), kd(1, 130.0, "x", 10.0)], vec![]);
+        let t2 = trace_of(vec![kd(1, 100.0, "a", 10.0)], vec![]);
+        let app =
+            App::new_multi(vec![("T0".into(), t0), ("T1".into(), t1), ("T2".into(), t2)]);
+        assert!(app.kernel_diff_status.iter().all(|s| s.is_none()));
+    }
+
+    // ── Per-column priority render (lane_column_classes) ─────────────────────
+
+    // Diff app where a wide MATCHED kernel spans a narrow ADDED / DELETED one so
+    // the priority resolution is exercised. Stream 1:
+    //   t0: reduce@100 dur 400 (matched), gone@200 dur 20 (deleted-only in t0)
+    //   t1: reduce@100 dur 400 (matched), extra@200 dur 20 (added-only in t1)
+    // Under diff, reduce matches; gone is Deleted (t0), extra is Added (t1).
+    fn overlap_diff_app() -> App {
+        let t0 = trace_of(
+            vec![kd(1, 100.0, "reduce", 400.0), kd(1, 200.0, "gone", 20.0)],
+            vec![],
+        );
+        let t1 = trace_of(
+            vec![kd(1, 100.0, "reduce", 400.0), kd(1, 200.0, "extra", 20.0)],
+            vec![],
+        );
+        App::new_multi(vec![("T0".into(), t0), ("T1".into(), t1)])
+    }
+
+    fn kernel_lane(app: &App, tid: usize) -> usize {
+        app.lanes
+            .iter()
+            .position(|l| !l.is_annotations() && l.trace_id() == tid)
+            .unwrap()
+    }
+
+    // Parks the active lane out of range so nothing is the selected item; tests
+    // that exercise class/geometry (not selection) start from a clean slate.
+    fn no_selection(app: &mut App) {
+        app.active_lane = usize::MAX;
+    }
+
+    // S1: non-overlapping kernels each own their own columns; owner_pos correct;
+    // gaps are None.
+    #[test]
+    fn test_columns_s1_non_overlapping_own_columns() {
+        let mut app = app_from(vec![kd(1, 0.0, "a", 10.0), kd(1, 50.0, "b", 10.0)]);
+        no_selection(&mut app);
+        let lane = kernel_lane(&app, 0);
+        // Window [0,100) over width 100 -> a: cols 0..10, b: cols 50..60.
+        let cols = app.lane_column_classes(lane, 0.0, 100.0, 100, false);
+        assert_eq!(cols.len(), 100);
+        assert_eq!(cols[5], Some((ColumnClass::Matched, 0)), "a owns col 5");
+        assert_eq!(cols[55], Some((ColumnClass::Matched, 1)), "b owns col 55");
+        assert_eq!(cols[30], None, "gap is empty");
+    }
+
+    // S2 (the bug): a wide MATCHED kernel overlapping a narrow ADDED kernel's
+    // columns -> those columns are Added, not Matched. This is the column the old
+    // cursor-clamp dropped.
+    #[test]
+    fn test_columns_s2_added_wins_over_wide_matched() {
+        let mut app = overlap_diff_app();
+        no_selection(&mut app);
+        let lane1 = kernel_lane(&app, 1);
+        let extra_pos = app.lanes[lane1]
+            .item_indices()
+            .iter()
+            .position(|&i| app.kernels[i].name == "extra")
+            .unwrap();
+        // reduce spans render cols 0..400 (rs 100..500); the diff shifts extra to
+        // render 220..240, i.e. cols 120..140 in this [100,500) width-400 window.
+        let cols = app.lane_column_classes(lane1, 100.0, 400.0, 400, true);
+        assert_eq!(
+            cols[130],
+            Some((ColumnClass::Added, extra_pos)),
+            "added kernel wins its column over the wide matched reduce"
+        );
+        // A column the reduce covers but extra does not -> Matched.
+        assert_eq!(
+            cols[10].map(|(c, _)| c),
+            Some(ColumnClass::Matched),
+            "reduce-only column stays matched"
+        );
+    }
+
+    // S3: wide Matched over a narrow Deleted -> those columns Deleted.
+    #[test]
+    fn test_columns_s3_deleted_wins_over_wide_matched() {
+        let mut app = overlap_diff_app();
+        no_selection(&mut app);
+        let lane0 = kernel_lane(&app, 0);
+        let gone_pos = app.lanes[lane0]
+            .item_indices()
+            .iter()
+            .position(|&i| app.kernels[i].name == "gone")
+            .unwrap();
+        let cols = app.lane_column_classes(lane0, 100.0, 400.0, 400, true);
+        assert_eq!(cols[110], Some((ColumnClass::Deleted, gone_pos)));
+    }
+
+    // S4: selected kernel columns win over an overlapping matched kernel.
+    #[test]
+    fn test_columns_s4_selected_wins() {
+        let mut app = overlap_diff_app();
+        let lane1 = kernel_lane(&app, 1);
+        // Select the "extra" (added) kernel; its columns must become Selected.
+        app.active_lane = lane1;
+        let extra_pos = app.lanes[lane1]
+            .item_indices()
+            .iter()
+            .position(|&i| app.kernels[i].name == "extra")
+            .unwrap();
+        app.selected_item = extra_pos;
+        let cols = app.lane_column_classes(lane1, 100.0, 400.0, 400, true);
+        assert_eq!(cols[130], Some((ColumnClass::Selected, extra_pos)));
+        // The reduce-only column stays matched (not the active selection).
+        assert_eq!(cols[10].map(|(c, _)| c), Some(ColumnClass::Matched));
+    }
+
+    // S5: a column overlapped by both an Added and a Deleted kernel -> Deleted
+    // (rank 3 > 2). Build a synthetic app by overriding diff status directly.
+    #[test]
+    fn test_columns_s5_deleted_beats_added() {
+        // Two kernels at the SAME columns in one lane, one Added one Deleted.
+        let mut app = app_from(vec![kd(1, 100.0, "x", 50.0), kd(1, 100.0, "y", 50.0)]);
+        no_selection(&mut app);
+        let lane = kernel_lane(&app, 0);
+        let items = app.lanes[lane].item_indices().to_vec();
+        // Force diff statuses: items[0]=Added, items[1]=Deleted.
+        app.kernel_diff_status[items[0]] = Some(KernelDiff::Added);
+        app.kernel_diff_status[items[1]] = Some(KernelDiff::Deleted);
+        let cols = app.lane_column_classes(lane, 100.0, 50.0, 50, true);
+        assert_eq!(
+            cols[10].map(|(c, _)| c),
+            Some(ColumnClass::Deleted),
+            "deleted outranks added on a contested column"
+        );
+    }
+
+    // S6: gaps between kernels are None.
+    #[test]
+    fn test_columns_s6_gaps_are_empty() {
+        let mut app = app_from(vec![kd(1, 0.0, "a", 5.0), kd(1, 80.0, "b", 5.0)]);
+        no_selection(&mut app);
+        let lane = kernel_lane(&app, 0);
+        let cols = app.lane_column_classes(lane, 0.0, 100.0, 100, false);
+        assert!(cols[40].is_none(), "mid gap empty");
+        assert!(cols[0].is_some(), "a present at start");
+    }
+
+    // S7: non-diff mode collapses every non-selected kernel to Matched even when
+    // kernel_diff would report Added/Deleted.
+    #[test]
+    fn test_columns_s7_non_diff_all_matched() {
+        let mut app = overlap_diff_app();
+        let lane1 = kernel_lane(&app, 1);
+        // Sanity: in diff, extra is Added.
+        let cols_diff = app.lane_column_classes(lane1, 100.0, 400.0, 400, true);
+        assert_eq!(cols_diff[130].map(|(c, _)| c), Some(ColumnClass::Added));
+        // Non-diff: same column is Matched (base colour in the UI), not Added.
+        app.active_lane = usize::MAX; // ensure nothing is the active/selected lane
+        let cols_norm = app.lane_column_classes(lane1, 100.0, 400.0, 400, false);
+        assert_eq!(cols_norm[130].map(|(c, _)| c), Some(ColumnClass::Matched));
+        assert!(cols_norm
+            .iter()
+            .flatten()
+            .all(|(c, _)| *c == ColumnClass::Matched));
+    }
+
+    // ── Mouse hit-testing ────────────────────────────────────────────────────
+
+    // Single trace, one stream, three kernels laid out across a known window.
+    // A click inside a kernel's columns selects that kernel.
+    fn mouse_app() -> App {
+        // Kernels a@0..10, b@20..30, c@40..50 on stream 1.
+        let mut app = app_from(vec![
+            kd(1, 0.0, "a", 10.0),
+            kd(1, 20.0, "b", 10.0),
+            kd(1, 40.0, "c", 10.0),
+        ]);
+        // Simulate a render: gutter 10 wide, timeline 50 wide, window [0,50).
+        app.lane_layout = LaneLayout {
+            inner_x: 0,
+            inner_y: 1,
+            inner_h: 4,
+            label_width: 10,
+            lane_width: 50,
+            view_offset: 0,
+            ts_start: 0.0,
+            time_span: 50.0,
+        };
+        app
+    }
+
+    #[test]
+    fn test_click_selects_kernel_under_cursor() {
+        let mut app = mouse_app();
+        // Timeline x0 = inner_x + label_width = 10. Kernel "b" spans ts 20..30,
+        // which in a 50-wide window maps to cols 20..30 -> screen 30..40.
+        assert!(app.click_select(32, 1), "click on kernel lane row");
+        match app.selected_trace_item().unwrap() {
+            SelectedTraceItem::Kernel(k) => assert_eq!(k.name, "b"),
+            _ => panic!("expected kernel b"),
+        }
+    }
+
+    #[test]
+    fn test_click_first_and_last_kernel() {
+        let mut app = mouse_app();
+        // "a" spans ts 0..10 -> screen cols 10..20.
+        assert!(app.click_select(11, 1));
+        assert_eq!(app.selected_item, 0);
+        // "c" spans ts 40..50 -> screen cols 50..60.
+        assert!(app.click_select(52, 1));
+        assert_eq!(app.selected_item, 2);
+    }
+
+    #[test]
+    fn test_click_empty_space_selects_nearest() {
+        let mut app = mouse_app();
+        // Gap between "a" (screen 10..20) and "b" (screen 30..40): click at 26
+        // is nearest to "b" (center 35, dist 9) vs "a" (center 15, dist 11).
+        assert!(app.click_select(26, 1));
+        assert_eq!(app.selected_item, 1, "nearest item is b");
+    }
+
+    #[test]
+    fn test_click_in_label_gutter_activates_lane_only() {
+        let mut app = mouse_app();
+        app.selected_item = 2;
+        // Column 3 is inside the 10-wide gutter -> activates lane, keeps item.
+        assert!(app.click_select(3, 1));
+        assert_eq!(app.active_lane, 0);
+        assert_eq!(app.selected_item, 2, "gutter click preserves selection");
+    }
+
+    #[test]
+    fn test_click_outside_lane_area_is_noop() {
+        let mut app = mouse_app();
+        app.selected_item = 1;
+        // Row 0 is above inner_y (1); row 5 is below inner_y+inner_h (5).
+        assert!(!app.click_select(30, 0));
+        assert!(!app.click_select(30, 5));
+        assert_eq!(app.selected_item, 1, "out-of-area clicks change nothing");
+    }
+
+    #[test]
+    fn test_click_selects_correct_lane_across_rows() {
+        // Two streams -> two kernel lanes stacked at rows 1 and 2.
+        let mut app = app_from(vec![kd(1, 0.0, "s1k", 10.0), kd(2, 0.0, "s2k", 10.0)]);
+        assert_eq!(app.lanes.len(), 2);
+        app.lane_layout = LaneLayout {
+            inner_x: 0,
+            inner_y: 1,
+            inner_h: 4,
+            label_width: 10,
+            lane_width: 50,
+            view_offset: 0,
+            ts_start: 0.0,
+            time_span: 50.0,
+        };
+        // Click row 2 (second lane), inside its kernel columns.
+        assert!(app.click_select(12, 2));
+        assert_eq!(app.active_lane, 1);
+        match app.selected_trace_item().unwrap() {
+            SelectedTraceItem::Kernel(k) => assert_eq!(k.name, "s2k"),
+            _ => panic!("expected kernel s2k"),
+        }
+    }
+
+    #[test]
+    fn test_click_honors_view_offset() {
+        let mut app = app_from(vec![
+            kd(1, 0.0, "s1", 10.0),
+            kd(2, 0.0, "s2", 10.0),
+            kd(3, 0.0, "s3", 10.0),
+        ]);
+        assert_eq!(app.lanes.len(), 3);
+        // Scrolled so lane 1 is the first visible row.
+        app.lane_layout = LaneLayout {
+            inner_x: 0,
+            inner_y: 1,
+            inner_h: 2,
+            label_width: 10,
+            lane_width: 50,
+            view_offset: 1,
+            ts_start: 0.0,
+            time_span: 50.0,
+        };
+        // Row 1 now maps to lane index 1 (view_offset 1 + 0).
+        assert!(app.click_select(12, 1));
+        assert_eq!(app.active_lane, 1);
     }
 
     // ── Short trace labels (strip common prefix + suffix) ────────────────────
+
 
     #[test]
     fn test_short_labels_strip_common_prefix_and_suffix() {
