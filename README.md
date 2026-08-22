@@ -49,8 +49,10 @@ pytorch-trace-tui my_trace.pt.trace.json.gz
 # Overlay several traces to compare them side by side
 pytorch-trace-tui baseline.pt.trace.json.gz tuned.pt.trace.json.gz
 
-# Or run with no argument to scan the current directory for
-# *.pt.trace.json.gz and pick one — or several — interactively.
+# Or run with no argument to scan the current directory tree recursively for
+# *.pt.trace.json.gz and pick one — or several — interactively. Traces are
+# discovered under nested folders (e.g. logs/<run>/traces/) and labelled by
+# run and rank so runs that share a filename stay distinguishable.
 # At the picker, enter one number, or several ("1 3" or "1,3") to overlay.
 pytorch-trace-tui
 ```
@@ -185,7 +187,7 @@ overflow the model's context:
 
 | Tool | Arguments | Returns |
 | --- | --- | --- |
-| `list_traces` | — | `*.pt.trace.json.gz` in the working directory |
+| `list_traces` | — | relative paths of every `*.pt.trace.json.gz` found recursively under the working directory (e.g. `logs/<run>/traces/…`); each path is directly reusable as the `path` argument below |
 | `summary` | `path` | kernel/annotation counts, streams, duration, and a per-stage (prefill/decode/mixed/none) breakdown |
 | `lane_kernels_csv` | `path`, `stream`, `offset?`, `limit?`, `stage?` | per-stream kernel CSV incl. the `annotation` and `stage` columns; optional `stage` (`prefill`/`decode`/`mixed`) returns only matching kernels |
 | `kernel_sequence` | `path`, `stream`, `kernel_name`, `offset?`, `limit?`, `stage?` | the kernel block from a named kernel up to its next occurrence; optional `stage` filter |
@@ -232,10 +234,14 @@ startup.
 
 ### Working directory
 
-`list_traces` scans the **current directory** for `*.pt.trace.json.gz`, so run
-the server from your traces folder (Claude Code launches it in the directory
-where you started `claude`; Claude Desktop uses the `cwd` above). The other
-tools take an explicit `path`, so they work regardless of the working directory.
+`list_traces` scans the **current directory tree recursively** for
+`*.pt.trace.json.gz` and returns each hit as a path relative to the working
+directory, so pointing the server at a workspace root (e.g. the folder holding
+`logs/<run>/traces/`) surfaces every run's traces. Run the server from that root
+(Claude Code launches it in the directory where you started `claude`; Claude
+Desktop uses the `cwd` above). The other tools take an explicit `path` — pass
+one of the paths `list_traces` returned — so they work regardless of the
+working directory.
 
 ## License
 
