@@ -8,6 +8,7 @@ use crate::app::{annotation_for_kernel, csv_escape, stage_for_annotation_name};
 use crate::trace::{parse_trace, KernelEvent, Trace};
 use anyhow::Result;
 use std::collections::BTreeSet;
+use std::path::{Path, PathBuf};
 
 /// The vLLM iteration stage a kernel executes under, derived from the covering
 /// `gpu_user_annotation`. `None` means the kernel has no stage-bearing
@@ -86,16 +87,127 @@ fn effective_limit(limit: Option<usize>) -> usize {
     limit.unwrap_or(DEFAULT_LIMIT).min(MAX_ROWS)
 }
 
-/// Scans a directory for PyTorch profiler traces (`*.pt.trace.json.gz`),
-/// returning their file names sorted for determinism.
+/// Recursively scans `dir` for PyTorch profiler traces (`*.pt.trace.json.gz`)
+/// and returns their paths relative to `dir`, sorted for determinism. The user
+/// workflow nests traces at `logs/<run>/traces/*.pt.trace.json.gz`, so a flat
+/// scan misses them; this walks the tree. Returns an empty vec (not an error)
+/// when none are found. The returned relative paths are directly reusable as the
+/// `path` argument of the other MCP tools.
 pub fn list_traces_in_dir(dir: &str) -> Result<Vec<String>> {
-    let mut names: Vec<String> = std::fs::read_dir(dir)?
-        .filter_map(|e| e.ok())
-        .filter_map(|e| e.file_name().into_string().ok())
-        .filter(|n| n.ends_with(".pt.trace.json.gz"))
+    let root = Path::new(dir);
+    let mut hits: Vec<PathBuf> = Vec::new();
+    walk_traces(root, 0, &mut hits);
+    let mut rel: Vec<String> = hits
+        .iter()
+        .map(|p| {
+            p.strip_prefix(root)
+                .unwrap_or(p)
+                .to_string_lossy()
+                .into_owned()
+        })
         .collect();
-    names.sort();
-    Ok(names)
+    rel.sort();
+    Ok(rel)
+}
+
+/// Bounded depth-first walk collecting `*.pt.trace.json.gz` files. Skips
+/// symlinks (so an ancestor-pointing symlink can't cycle), hidden directories
+/// (names starting with `.`), and unreadable entries; caps recursion at
+/// `MAX_DEPTH`.
+fn walk_traces(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
+    const MAX_DEPTH: usize = 8;
+    if depth > MAX_DEPTH {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.filter_map(|e| e.ok()) {
+        let Ok(ft) = entry.file_type() else {
+            continue;
+        };
+        if ft.is_symlink() {
+            continue;
+        }
+        let path = entry.path();
+        if ft.is_dir() {
+            let hidden = entry
+                .file_name()
+                .to_str()
+                .map(|n| n.starts_with('.'))
+                .unwrap_or(true);
+            if hidden {
+                continue;
+            }
+            walk_traces(&path, depth + 1, out);
+        } else if entry
+            .file_name()
+            .to_str()
+            .map(|n| n.ends_with(".pt.trace.json.gz"))
+            .unwrap_or(false)
+        {
+            out.push(path);
+        }
+    }
+}
+
+/// Compact display label for a trace, disambiguating traces that share a
+/// filename across runs. The user's layout is `logs/<run>/traces/<file>`, where
+/// `<file>` (e.g. `dp0_..._rank7....pt.trace.json.gz`) repeats every run — so
+/// the label combines the run folder (the segment before `traces/`, else the
+/// immediate parent) with the rank (`rankN` parsed from the filename, else the
+/// filename stem). A flat trace with no meaningful parent falls back to its stem.
+pub fn trace_display_label(path: &str) -> String {
+    let p = Path::new(path);
+    let file = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
+    let stem = file
+        .strip_suffix(".pt.trace.json.gz")
+        .or_else(|| file.strip_suffix(".json.gz"))
+        .or_else(|| file.strip_suffix(".json"))
+        .unwrap_or(file);
+
+    let run = run_folder(p);
+    let leaf = rank_of(stem).unwrap_or_else(|| stem.to_string());
+
+    match run {
+        Some(r) if !leaf.is_empty() => format!("{r}/{leaf}"),
+        _ if !stem.is_empty() => stem.to_string(),
+        _ => "trace".to_string(),
+    }
+}
+
+/// The run folder for a trace path: the component immediately before `traces/`,
+/// else the immediate parent directory name (unless it is `.`).
+fn run_folder(p: &Path) -> Option<String> {
+    let comps: Vec<&str> = p
+        .components()
+        .filter_map(|c| c.as_os_str().to_str())
+        .collect();
+    if let Some(idx) = comps.iter().rposition(|&c| c == "traces") {
+        if idx > 0 {
+            return Some(comps[idx - 1].to_string());
+        }
+    }
+    p.parent()
+        .and_then(|par| par.file_name())
+        .and_then(|n| n.to_str())
+        .filter(|n| *n != ".")
+        .map(|n| n.to_string())
+}
+
+/// Extracts a `rankN` token from a filename stem: the literal `rank` followed by
+/// one or more digits (stopping at the first non-digit).
+fn rank_of(stem: &str) -> Option<String> {
+    let idx = stem.find("rank")?;
+    let digits: String = stem[idx + 4..]
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect();
+    if digits.is_empty() {
+        None
+    } else {
+        Some(format!("rank{digits}"))
+    }
 }
 
 /// Per-stage kernel count and summed duration, one entry per stage.
@@ -557,5 +669,139 @@ mod tests {
         assert_eq!(*decode, "decode\t3\t9.00\t3.00");
         let prefill = lines.iter().find(|l| l.starts_with("prefill\t")).unwrap();
         assert_eq!(*prefill, "prefill\t2\t6.00\t3.00");
+    }
+
+    fn unique_tmp(tag: &str) -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        let n = N.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!("ptt-{tag}-{}-{n}", std::process::id()))
+    }
+
+    fn touch(path: &std::path::Path) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, b"").unwrap();
+    }
+
+    #[test]
+    fn test_list_traces_in_dir_finds_nested() {
+        let root = unique_tmp("nested");
+        touch(&root.join("logs/run_a/traces/x.pt.trace.json.gz"));
+        touch(&root.join("logs/run_b/traces/x.pt.trace.json.gz"));
+        let got = list_traces_in_dir(root.to_str().unwrap()).unwrap();
+        assert_eq!(
+            got,
+            vec![
+                "logs/run_a/traces/x.pt.trace.json.gz".to_string(),
+                "logs/run_b/traces/x.pt.trace.json.gz".to_string(),
+            ]
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn test_list_traces_in_dir_finds_flat_and_nested() {
+        let root = unique_tmp("flatnested");
+        touch(&root.join("flat.pt.trace.json.gz"));
+        touch(&root.join("logs/run/traces/deep.pt.trace.json.gz"));
+        let got = list_traces_in_dir(root.to_str().unwrap()).unwrap();
+        assert_eq!(
+            got,
+            vec![
+                "flat.pt.trace.json.gz".to_string(),
+                "logs/run/traces/deep.pt.trace.json.gz".to_string(),
+            ]
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn test_list_traces_in_dir_empty_is_ok_not_err() {
+        let root = unique_tmp("empty");
+        std::fs::create_dir_all(&root).unwrap();
+        let got = list_traces_in_dir(root.to_str().unwrap()).unwrap();
+        assert!(got.is_empty());
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn test_list_traces_in_dir_ignores_non_traces() {
+        let root = unique_tmp("ignore");
+        touch(&root.join("a.json"));
+        touch(&root.join("b.txt"));
+        touch(&root.join("c.pt.trace.json"));
+        let got = list_traces_in_dir(root.to_str().unwrap()).unwrap();
+        assert!(got.is_empty(), "only *.pt.trace.json.gz counts: {got:?}");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn test_list_traces_in_dir_skips_hidden_dirs() {
+        let root = unique_tmp("hidden");
+        touch(&root.join(".cache/traces/x.pt.trace.json.gz"));
+        touch(&root.join("visible/traces/y.pt.trace.json.gz"));
+        let got = list_traces_in_dir(root.to_str().unwrap()).unwrap();
+        assert_eq!(got, vec!["visible/traces/y.pt.trace.json.gz".to_string()]);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_list_traces_in_dir_does_not_follow_symlink_cycle() {
+        let root = unique_tmp("cycle");
+        touch(&root.join("logs/traces/x.pt.trace.json.gz"));
+        // A symlink pointing back to an ancestor would loop a naive walker.
+        std::os::unix::fs::symlink(&root, root.join("logs/loop")).unwrap();
+        let got = list_traces_in_dir(root.to_str().unwrap()).unwrap();
+        assert_eq!(got, vec!["logs/traces/x.pt.trace.json.gz".to_string()]);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn test_label_run_and_rank() {
+        assert_eq!(
+            trace_display_label(
+                "logs/20250115_1200-tp8/traces/dp0_pp0_tp7_dcp0_ep7_rank7.178.pt.trace.json.gz"
+            ),
+            "20250115_1200-tp8/rank7"
+        );
+    }
+
+    #[test]
+    fn test_label_run_no_rank() {
+        assert_eq!(
+            trace_display_label("logs/run/traces/foo.pt.trace.json.gz"),
+            "run/foo"
+        );
+    }
+
+    #[test]
+    fn test_label_flat_stem() {
+        assert_eq!(trace_display_label("flat.pt.trace.json.gz"), "flat");
+    }
+
+    #[test]
+    fn test_label_no_traces_parent_uses_parent() {
+        assert_eq!(
+            trace_display_label("logs/run/foo_rank3.pt.trace.json.gz"),
+            "run/rank3"
+        );
+    }
+
+    #[test]
+    fn test_label_rank_parsing_boundaries() {
+        assert_eq!(
+            trace_display_label("logs/r/traces/a_rank12_b.pt.trace.json.gz"),
+            "r/rank12"
+        );
+        assert_eq!(
+            trace_display_label("logs/r/traces/norankhere.pt.trace.json.gz"),
+            "r/norankhere"
+        );
+    }
+
+    #[test]
+    fn test_label_empty_stem_fallback() {
+        assert_eq!(trace_display_label(".pt.trace.json.gz"), "trace");
     }
 }

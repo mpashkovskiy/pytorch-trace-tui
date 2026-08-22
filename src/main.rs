@@ -19,7 +19,6 @@ use crossterm::{
 use ratatui::{backend::CrosstermBackend, Terminal};
 use std::io::{self, stdout, BufRead, Write};
 use std::panic;
-use std::path::PathBuf;
 use std::time::Duration;
 
 #[derive(Parser, Debug)]
@@ -50,13 +49,7 @@ struct Cli {
 }
 
 fn trace_label(path: &str, _index: usize) -> String {
-    std::path::Path::new(path)
-        .file_name()
-        .and_then(|n| n.to_str())
-        .map(|n| n.trim_end_matches(".gz").trim_end_matches(".json").trim_end_matches(".pt.trace"))
-        .filter(|s| !s.is_empty())
-        .unwrap_or("trace")
-        .to_string()
+    mcp_core::trace_display_label(path)
 }
 
 fn main() -> Result<()> {
@@ -158,34 +151,28 @@ fn parse_selection(input: &str, count: usize) -> Result<Option<Vec<usize>>> {
 }
 
 fn select_trace_interactively() -> Result<Option<Vec<String>>> {
-    let mut traces: Vec<(PathBuf, std::time::SystemTime, u64)> = std::fs::read_dir(".")
-        .context("Failed to read current directory")?
-        .filter_map(|entry| entry.ok().map(|e| e.path()))
-        .filter(|p| {
-            p.file_name()
-                .and_then(|n| n.to_str())
-                .map(|n| n.ends_with(".pt.trace.json.gz"))
-                .unwrap_or(false)
-        })
-        .filter_map(|p| {
-            let meta = std::fs::metadata(&p).ok()?;
+    let mut traces: Vec<(String, std::time::SystemTime, u64)> = mcp_core::list_traces_in_dir(".")
+        .context("Failed to scan for traces")?
+        .into_iter()
+        .filter_map(|rel| {
+            let meta = std::fs::metadata(&rel).ok()?;
             let mtime = meta.modified().ok()?;
             let size = meta.len();
-            Some((p, mtime, size))
+            Some((rel, mtime, size))
         })
         .collect();
 
     if traces.is_empty() {
-        bail!("No trace file given and no *.pt.trace.json.gz found in current directory");
+        bail!("No trace file given and no *.pt.trace.json.gz found under the current directory");
     }
 
-    traces.sort_by(|a, b| b.1.cmp(&a.1));
+    traces.sort_by_key(|t| std::cmp::Reverse(t.1));
 
     println!("Select trace(s) to open:");
     for (i, (path, mtime, size)) in traces.iter().enumerate() {
-        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("?");
+        let label = mcp_core::trace_display_label(path);
         let dt = format_mtime(*mtime);
-        println!("  [{}] {}  {}  {}", i + 1, dt, human_size(*size), name);
+        println!("  [{}] {}  {}  {}", i + 1, dt, human_size(*size), label);
     }
     print!(
         "Enter number(s) (e.g. 1 or '1 3' to overlay, 1-{}, or q to quit): ",
@@ -205,7 +192,7 @@ fn select_trace_interactively() -> Result<Option<Vec<String>>> {
         Some(choices) => Ok(Some(
             choices
                 .into_iter()
-                .map(|c| traces[c - 1].0.to_string_lossy().into_owned())
+                .map(|c| traces[c - 1].0.clone())
                 .collect(),
         )),
     }
