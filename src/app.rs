@@ -927,17 +927,23 @@ impl App {
             return None;
         };
         let mut out = String::from(
-            "idx,name,ts,dur,end_ts,stream,device,grid,block,shared_memory,\
-             registers_per_thread,correlation\n",
+            "idx,annotation,stage,name,ts,dur,end_ts,stream,device,grid,block,\
+             shared_memory,registers_per_thread,correlation\n",
         );
         let opt_u64 = |v: Option<u64>| v.map(|n| n.to_string()).unwrap_or_default();
         for (row, &ki) in item_indices.iter().enumerate() {
             let Some(k) = self.kernels.get(ki) else {
                 continue;
             };
+            let ann =
+                annotation_for_kernel(&self.annotations, k.stream, k.trace_id, k.ts);
+            let ann_name = ann.map(|a| a.name.as_str()).unwrap_or("");
+            let stage = ann.map(|a| stage_for_annotation_name(&a.name)).unwrap_or("");
             out.push_str(&format!(
-                "{},{},{},{},{},{},{},{},{},{},{},{}\n",
+                "{},{},{},{},{},{},{},{},{},{},{},{},{},{}\n",
                 row + 1,
+                csv_escape(ann_name),
+                stage,
                 csv_escape(&k.name),
                 k.ts,
                 k.dur,
@@ -1448,6 +1454,90 @@ pub fn kernel_columns(
         return None;
     }
     Some((start_col, end_col))
+}
+
+/// Derives the vLLM iteration stage (`prefill`/`decode`/`mixed`) from a
+/// `gpu_user_annotation` name emitted by vLLM's `gpu_worker.py`.
+///
+/// Two formats are recognised, both carrying a *request* count before each
+/// parenthesised *token* count:
+///   simple:   `execute_context_<ctx>(<n>)_generation_<gen>(<n>)`
+///   detailed: `execute_<total>_context_<ctx>(...)_generation_<gen>(...)`
+///
+/// Classification uses the request counts (`ctx`, `gen`):
+/// `ctx>0,gen==0`→prefill, `ctx==0,gen>0`→decode, both>0→mixed. Names that do
+/// not match (e.g. `nccl:_all_gather_base`) yield `""`.
+fn stage_for_annotation_name(name: &str) -> &'static str {
+    let parse_counts = |s: &str| -> Option<(u64, u64)> {
+        let after_prefix = s.strip_prefix("execute_")?;
+        // Detailed form has a numeric total before `context_`; skip it if present.
+        let rest = match after_prefix.strip_prefix("context_") {
+            Some(r) => r,
+            None => {
+                let (total, r) = after_prefix.split_once("_context_")?;
+                if !total.chars().all(|c| c.is_ascii_digit()) {
+                    return None;
+                }
+                r
+            }
+        };
+        // `rest` = `<ctx>(...)_generation_<gen>(...)`. Read leading ctx request count.
+        let ctx: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+        if ctx.is_empty() {
+            return None;
+        }
+        let gen_marker = "_generation_";
+        let gpos = rest.find(gen_marker)?;
+        let after_gen = &rest[gpos + gen_marker.len()..];
+        let gen: String = after_gen
+            .chars()
+            .take_while(|c| c.is_ascii_digit())
+            .collect();
+        if gen.is_empty() {
+            return None;
+        }
+        Some((ctx.parse().ok()?, gen.parse().ok()?))
+    };
+
+    match parse_counts(name) {
+        Some((ctx, gen)) if ctx > 0 && gen == 0 => "prefill",
+        Some((ctx, gen)) if ctx == 0 && gen > 0 => "decode",
+        Some((ctx, gen)) if ctx > 0 && gen > 0 => "mixed",
+        _ => "",
+    }
+}
+
+/// Finds the annotation whose time window `[ts, end_ts)` contains `kernel_ts`,
+/// restricted to the same `stream` and `trace_id`. When several overlap, the
+/// tightest (smallest `dur`) wins; ties break toward the later-starting (inner)
+/// annotation, then the lowest flat index for determinism.
+fn annotation_for_kernel(
+    annotations: &[AnnotationEvent],
+    stream: u64,
+    trace_id: usize,
+    kernel_ts: f64,
+) -> Option<&AnnotationEvent> {
+    let mut best: Option<&AnnotationEvent> = None;
+    for a in annotations {
+        if a.stream != stream || a.trace_id != trace_id {
+            continue;
+        }
+        if !(a.ts <= kernel_ts && kernel_ts < a.end_ts()) {
+            continue;
+        }
+        best = match best {
+            None => Some(a),
+            Some(b) => {
+                let tighter = a.dur < b.dur || (a.dur == b.dur && a.ts > b.ts);
+                if tighter {
+                    Some(a)
+                } else {
+                    Some(b)
+                }
+            }
+        };
+    }
+    best
 }
 
 /// Quotes a CSV field per RFC 4180 when it contains a comma, quote, or newline
@@ -2134,15 +2224,16 @@ mod tests {
         let lines: Vec<&str> = csv.lines().collect();
         assert_eq!(
             lines[0],
-            "idx,name,ts,dur,end_ts,stream,device,grid,block,shared_memory,registers_per_thread,correlation"
+            "idx,annotation,stage,name,ts,dur,end_ts,stream,device,grid,block,shared_memory,registers_per_thread,correlation"
         );
-        // Row 1: gemm with all fields; grid/block quoted (contain commas).
+        // Row 1: gemm with all fields; grid/block quoted (contain commas). No
+        // annotations in this fixture, so annotation+stage are empty.
         assert_eq!(
             lines[1],
-            "1,gemm,100,30,130,4,7,\"[32,1,1]\",\"[128,1,1]\",2048,64,999"
+            "1,,,gemm,100,30,130,4,7,\"[32,1,1]\",\"[128,1,1]\",2048,64,999"
         );
         // Row 2: relu with empty optional fields.
-        assert_eq!(lines[2], "2,relu,200,10,210,4,0,,,,,");
+        assert_eq!(lines[2], "2,,,relu,200,10,210,4,0,,,,,");
         assert_eq!(lines.len(), 3, "header + 2 kernels");
     }
 
@@ -2167,6 +2258,151 @@ mod tests {
             app.lane_kernels_csv().is_none(),
             "annotation lane is not exportable"
         );
+    }
+
+    // S1/S2/S3/S4: `annotation` + `stage` are columns 2 and 3. Each kernel is
+    // tagged with the annotation whose [ts,end_ts) window (same stream+trace)
+    // contains its ts, and the derived prefill/decode/mixed stage. Kernels with
+    // no covering annotation get empty annotation+stage. Overlapping annotations
+    // resolve to the tightest (shortest-span) one.
+    #[test]
+    fn test_lane_kernels_csv_annotation_stage_columns() {
+        // Stream 4: three kernels.
+        //  k@100 -> covered by decode annotation [90,140)
+        //  k@200 -> covered by BOTH a wide [150,300) and a tight prefill [195,215);
+        //           the tight one wins.
+        //  k@400 -> no covering annotation -> empty annotation+stage.
+        let kernels = vec![
+            named_kernel(4, 100.0, "gemm"),
+            named_kernel(4, 200.0, "relu"),
+            named_kernel(4, 400.0, "add"),
+        ];
+        let annotations = vec![
+            AnnotationEvent {
+                name: "execute_context_0(0)_generation_1(1)".to_string(),
+                ts: 90.0,
+                dur: 50.0, // [90,140)
+                stream: 4,
+                trace_id: 0,
+            },
+            AnnotationEvent {
+                name: "wide_noise".to_string(),
+                ts: 150.0,
+                dur: 150.0, // [150,300) — wider, must lose to the tight one
+                stream: 4,
+                trace_id: 0,
+            },
+            AnnotationEvent {
+                name: "execute_context_1(5)_generation_0(0)".to_string(),
+                ts: 195.0,
+                dur: 20.0, // [195,215) — tight, wins for k@200
+                stream: 4,
+                trace_id: 0,
+            },
+        ];
+        let app = App::new(Trace {
+            kernels,
+            annotations,
+        });
+
+        let csv = app.lane_kernels_csv().expect("kernel lane produces CSV");
+        let lines: Vec<&str> = csv.lines().collect();
+        assert_eq!(
+            lines[0],
+            "idx,annotation,stage,name,ts,dur,end_ts,stream,device,grid,block,shared_memory,registers_per_thread,correlation"
+        );
+        // k@100: decode annotation.
+        assert_eq!(
+            lines[1],
+            "1,execute_context_0(0)_generation_1(1),decode,gemm,100,5,105,4,0,,,,,"
+        );
+        // k@200: tightest overlap = prefill annotation (wide_noise loses).
+        assert_eq!(
+            lines[2],
+            "2,execute_context_1(5)_generation_0(0),prefill,relu,200,5,205,4,0,,,,,"
+        );
+        // k@400: no covering annotation -> empty annotation + stage.
+        assert_eq!(lines[3], "3,,,add,400,5,405,4,0,,,,,");
+        assert_eq!(lines.len(), 4, "header + 3 kernels");
+    }
+
+    #[test]
+    fn test_stage_prefill() {
+        assert_eq!(
+            stage_for_annotation_name("execute_context_1(5)_generation_0(0)"),
+            "prefill"
+        );
+    }
+
+    #[test]
+    fn test_stage_decode() {
+        assert_eq!(
+            stage_for_annotation_name("execute_context_0(0)_generation_1(1)"),
+            "decode"
+        );
+    }
+
+    #[test]
+    fn test_stage_mixed() {
+        assert_eq!(
+            stage_for_annotation_name("execute_context_2(8)_generation_3(3)"),
+            "mixed"
+        );
+    }
+
+    #[test]
+    fn test_stage_none_on_nccl() {
+        assert_eq!(stage_for_annotation_name("nccl:_all_gather_base"), "");
+    }
+
+    #[test]
+    fn test_stage_none_on_garbage() {
+        assert_eq!(stage_for_annotation_name("execute_context_x(0)"), "");
+        assert_eq!(stage_for_annotation_name(""), "");
+        assert_eq!(stage_for_annotation_name("execute_context_1(5)"), "");
+    }
+
+    #[test]
+    fn test_stage_detailed_form() {
+        assert_eq!(
+            stage_for_annotation_name(
+                "execute_9_context_1(sq4sk10sqsq0sqsk0)_generation_0(sq0sk0sqsq0sqsk0)"
+            ),
+            "prefill"
+        );
+        assert_eq!(
+            stage_for_annotation_name(
+                "execute_5_context_0(sq0sk0sqsq0sqsk0)_generation_5(sq5sk20sqsq0sqsk0)"
+            ),
+            "decode"
+        );
+    }
+
+    #[test]
+    fn test_annotation_tightest_overlap_tie_break() {
+        // Two equal-duration annotations both cover ts=100; the later-starting
+        // (inner) one wins the tie.
+        let anns = vec![
+            AnnotationEvent {
+                name: "outer".into(),
+                ts: 90.0,
+                dur: 20.0,
+                stream: 4,
+                trace_id: 0,
+            },
+            AnnotationEvent {
+                name: "inner".into(),
+                ts: 95.0,
+                dur: 20.0,
+                stream: 4,
+                trace_id: 0,
+            },
+        ];
+        let picked = annotation_for_kernel(&anns, 4, 0, 100.0).unwrap();
+        assert_eq!(picked.name, "inner");
+        // Wrong stream / trace_id are excluded.
+        assert!(annotation_for_kernel(&anns, 7, 0, 100.0).is_none());
+        assert!(annotation_for_kernel(&anns, 4, 1, 100.0).is_none());
     }
 
     #[test]

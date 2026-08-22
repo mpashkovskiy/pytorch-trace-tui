@@ -30,6 +30,16 @@ struct Cli {
     /// Trace file path(s). Pass two or more to overlay and align them by
     /// gpu_user_annotation. If omitted, scans the current dir for *.pt.trace.json.gz
     traces: Vec<String>,
+
+    /// Print the CSV for the kernel lane of the given CUDA stream to stdout and
+    /// exit, without launching the TUI (headless export).
+    #[arg(long, value_name = "STREAM")]
+    dump_lane_csv: Option<u64>,
+
+    /// Restrict --dump-lane-csv to a specific trace id (0-based) when several
+    /// traces are open. Defaults to the first trace containing the stream.
+    #[arg(long, value_name = "TRACE_ID")]
+    trace_id: Option<usize>,
 }
 
 fn trace_label(path: &str, _index: usize) -> String {
@@ -70,6 +80,12 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
+    let app = App::new_multi(labelled);
+
+    if let Some(stream) = cli.dump_lane_csv {
+        return dump_lane_csv(app, stream, cli.trace_id);
+    }
+
     eprintln!(
         "Loaded {} GPU kernels ({} annotations) from {} trace(s). Starting TUI...",
         total_kernels,
@@ -77,8 +93,31 @@ fn main() -> Result<()> {
         paths.len()
     );
 
-    let app = App::new_multi(labelled);
     run_tui(app)
+}
+
+/// Headless export: selects the kernel lane matching `stream` (optionally scoped
+/// to `trace_id`), prints its CSV to stdout, and returns. Used for scripting and
+/// verification without an interactive terminal.
+fn dump_lane_csv(mut app: App, stream: u64, trace_id: Option<usize>) -> Result<()> {
+    let lane_idx = app.lanes.iter().position(|l| {
+        !l.is_annotations()
+            && l.stream_id() == stream
+            && trace_id.map(|t| l.trace_id() == t).unwrap_or(true)
+    });
+    let Some(lane_idx) = lane_idx else {
+        bail!(
+            "No kernel lane for stream {}{}",
+            stream,
+            trace_id.map(|t| format!(" (trace {})", t)).unwrap_or_default()
+        );
+    };
+    app.active_lane = lane_idx;
+    let csv = app
+        .lane_kernels_csv()
+        .context("selected lane produced no CSV")?;
+    print!("{}", csv);
+    Ok(())
 }
 
 /// Parses a picker selection line into 1-based indices. Accepts space- and/or
