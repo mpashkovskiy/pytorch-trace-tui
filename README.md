@@ -168,6 +168,75 @@ with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof:
 prof.export_chrome_trace("my_trace.pt.trace.json.gz")
 ```
 
+## MCP server
+
+The same binary can run as a [Model Context Protocol](https://modelcontextprotocol.io)
+server over stdio, so an AI assistant (Claude Code, Claude Desktop, …) can
+inspect traces directly instead of you scrubbing the TUI and pasting CSVs into
+the chat:
+
+```bash
+pytorch-trace-tui --mcp
+```
+
+It exposes five read-only tools. Every list-returning tool is bounded by
+`offset`/`limit` (default 100, hard cap 1000) so a multi-gigabyte trace can't
+overflow the model's context:
+
+| Tool | Arguments | Returns |
+| --- | --- | --- |
+| `list_traces` | — | `*.pt.trace.json.gz` in the working directory |
+| `summary` | `path` | kernel/annotation counts, streams, duration, and a per-stage (prefill/decode/mixed/none) breakdown |
+| `lane_kernels_csv` | `path`, `stream`, `offset?`, `limit?`, `stage?` | per-stream kernel CSV incl. the `annotation` and `stage` columns; optional `stage` (`prefill`/`decode`/`mixed`) returns only matching kernels |
+| `kernel_sequence` | `path`, `stream`, `kernel_name`, `offset?`, `limit?`, `stage?` | the kernel block from a named kernel up to its next occurrence; optional `stage` filter |
+| `stage_summary` | `path`, `stream` | per-stage aggregate stats for a stream (kernel count, total and median duration) |
+
+The `stage` filters and `stage_summary` let you analyse **prefill** and
+**decode** phases separately — e.g. "give me only the decode kernels on stream
+4" returns a bounded, pre-filtered result.
+
+### Claude Code
+
+```bash
+claude mcp add pytorch-trace-tui -- /absolute/path/to/pytorch-trace-tui --mcp
+```
+
+Everything after `--` is the command Claude launches. Use `-s user` to register
+it for every project on the machine instead of just the current one:
+
+```bash
+claude mcp add -s user pytorch-trace-tui -- /absolute/path/to/pytorch-trace-tui --mcp
+```
+
+### Claude Desktop
+
+Add the server to `claude_desktop_config.json`:
+
+- Linux: `~/.config/Claude/claude_desktop_config.json`
+- macOS: `~/Library/Application Support/Claude/claude_desktop_config.json`
+
+```json
+{
+  "mcpServers": {
+    "pytorch-trace-tui": {
+      "command": "/absolute/path/to/pytorch-trace-tui",
+      "args": ["--mcp"],
+      "cwd": "/path/to/your/traces"
+    }
+  }
+}
+```
+
+Fully quit and reopen Claude Desktop after editing — the config is only read on
+startup.
+
+### Working directory
+
+`list_traces` scans the **current directory** for `*.pt.trace.json.gz`, so run
+the server from your traces folder (Claude Code launches it in the directory
+where you started `claude`; Claude Desktop uses the `cwd` above). The other
+tools take an explicit `path`, so they work regardless of the working directory.
+
 ## License
 
 MIT — see [LICENSE](LICENSE).
