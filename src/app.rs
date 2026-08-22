@@ -1467,7 +1467,7 @@ pub fn kernel_columns(
 /// Classification uses the request counts (`ctx`, `gen`):
 /// `ctx>0,gen==0`→prefill, `ctx==0,gen>0`→decode, both>0→mixed. Names that do
 /// not match (e.g. `nccl:_all_gather_base`) yield `""`.
-fn stage_for_annotation_name(name: &str) -> &'static str {
+pub(crate) fn stage_for_annotation_name(name: &str) -> &'static str {
     let parse_counts = |s: &str| -> Option<(u64, u64)> {
         let after_prefix = s.strip_prefix("execute_")?;
         // Detailed form has a numeric total before `context_`; skip it if present.
@@ -1511,7 +1511,7 @@ fn stage_for_annotation_name(name: &str) -> &'static str {
 /// restricted to the same `stream` and `trace_id`. When several overlap, the
 /// tightest (smallest `dur`) wins; ties break toward the later-starting (inner)
 /// annotation, then the lowest flat index for determinism.
-fn annotation_for_kernel(
+pub(crate) fn annotation_for_kernel(
     annotations: &[AnnotationEvent],
     stream: u64,
     trace_id: usize,
@@ -1542,7 +1542,7 @@ fn annotation_for_kernel(
 
 /// Quotes a CSV field per RFC 4180 when it contains a comma, quote, or newline
 /// (grid/block values like `[32,1,1]` contain commas). Inner quotes are doubled.
-fn csv_escape(field: &str) -> String {
+pub(crate) fn csv_escape(field: &str) -> String {
     if field.contains([',', '"', '\n', '\r']) {
         format!("\"{}\"", field.replace('"', "\"\""))
     } else {

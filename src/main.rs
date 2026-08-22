@@ -1,5 +1,7 @@
 mod app;
 mod clipboard;
+mod mcp;
+mod mcp_core;
 mod trace;
 mod ui;
 
@@ -40,6 +42,11 @@ struct Cli {
     /// traces are open. Defaults to the first trace containing the stream.
     #[arg(long, value_name = "TRACE_ID")]
     trace_id: Option<usize>,
+
+    /// Run as a Model Context Protocol (MCP) server over stdio instead of the
+    /// TUI, exposing read-only bounded trace-analysis tools to an AI assistant.
+    #[arg(long)]
+    mcp: bool,
 }
 
 fn trace_label(path: &str, _index: usize) -> String {
@@ -54,6 +61,11 @@ fn trace_label(path: &str, _index: usize) -> String {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+
+    if cli.mcp {
+        let rt = tokio::runtime::Runtime::new().context("failed to start async runtime")?;
+        return rt.block_on(mcp::serve());
+    }
 
     let paths: Vec<String> = if cli.traces.is_empty() {
         match select_trace_interactively()? {
