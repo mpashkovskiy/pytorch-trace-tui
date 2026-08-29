@@ -1049,6 +1049,28 @@ impl App {
         }
     }
 
+    /// Clamp the view so the last lane can't scroll above the fold, e.g. after
+    /// a terminal resize shrinks the number of scrollable rows.
+    pub fn clamp_lane_view_offset(&mut self, visible_rows: usize) {
+        let max_offset = self.lanes.len().saturating_sub(visible_rows.max(1));
+        self.lane_view_offset = self.lane_view_offset.min(max_offset);
+    }
+
+    /// Scroll the lane viewport up `amount` rows without moving the selection.
+    pub fn scroll_lanes_up(&mut self, amount: usize) {
+        self.lane_view_offset = self.lane_view_offset.saturating_sub(amount);
+    }
+
+    /// Scroll the lane viewport down `amount` rows, clamped so the last lane
+    /// can't scroll above the fold; selection is untouched.
+    pub fn scroll_lanes_down(&mut self, amount: usize, visible_rows: usize) {
+        let max_offset = self
+            .lanes
+            .len()
+            .saturating_sub(visible_rows.max(1));
+        self.lane_view_offset = (self.lane_view_offset + amount).min(max_offset);
+    }
+
     pub fn global_time_bounds(&self) -> (f64, f64) {
         let mut min_start = f64::MAX;
         let mut max_end = f64::MIN;
@@ -1094,15 +1116,6 @@ impl App {
         let ts_start = (center - visible_span / 2.0).max(g_start);
         let ts_end = (center + visible_span / 2.0).min(g_end);
         (ts_start, ts_end.max(ts_start + visible_span))
-    }
-
-    pub fn zoom_label(&self) -> String {
-        let z = self.zoom_level;
-        if z >= 10.0 {
-            format!("{:.0}x", z)
-        } else {
-            format!("{:.1}x", z)
-        }
     }
 }
 
@@ -1942,6 +1955,54 @@ mod tests {
         app.next_lane();
         app.ensure_active_lane_visible(visible_rows);
         assert_eq!(app.lane_view_offset, 2);
+    }
+
+    #[test]
+    fn test_scroll_lanes_moves_view_not_selection() {
+        let kernels = vec![
+            make_kernel(1, 0.0, 1.0),
+            make_kernel(2, 0.0, 1.0),
+            make_kernel(3, 0.0, 1.0),
+            make_kernel(4, 0.0, 1.0),
+        ];
+        let mut app = app_from(kernels);
+        assert_eq!(app.lanes.len(), 4);
+        let active = app.active_lane;
+
+        let visible_rows = 2;
+        app.scroll_lanes_down(1, visible_rows);
+        assert_eq!(app.lane_view_offset, 1);
+        assert_eq!(app.active_lane, active, "scroll leaves selection put");
+
+        app.scroll_lanes_down(1, visible_rows);
+        assert_eq!(app.lane_view_offset, 2);
+
+        app.scroll_lanes_down(5, visible_rows);
+        assert_eq!(app.lane_view_offset, 2, "clamped so last lane stays visible");
+
+        app.scroll_lanes_up(1);
+        assert_eq!(app.lane_view_offset, 1);
+        app.scroll_lanes_up(5);
+        assert_eq!(app.lane_view_offset, 0, "clamped at top");
+        assert_eq!(app.active_lane, active);
+    }
+
+    #[test]
+    fn test_startup_view_offset_is_top() {
+        let kernels = vec![make_kernel(1, 0.0, 1.0), make_kernel(2, 0.0, 1.0)];
+        let annotations = vec![
+            AnnotationEvent { name: "ctx_1".to_string(), ts: 0.0, dur: 1.0, stream: 1, trace_id: 0 },
+            AnnotationEvent { name: "ctx_2".to_string(), ts: 0.0, dur: 1.0, stream: 2, trace_id: 0 },
+        ];
+        let trace = Trace {
+            kernels,
+            annotations,
+        };
+        let app = App::new(trace);
+        assert_eq!(
+            app.lane_view_offset, 0,
+            "startup scrolled to top so annotation lanes are visible"
+        );
     }
 
     // ── Search over both kinds ───────────────────────────────────────────────

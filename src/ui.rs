@@ -159,38 +159,8 @@ fn render_sequence_popup(frame: &mut Frame, area: Rect, app: &App) {
 }
 
 fn render_header(frame: &mut Frame, area: Rect, app: &App) {
-    let lane_kind = if app.active_lane_is_annotations() {
-        "annotations"
-    } else {
-        "kernels"
-    };
     let line = Line::from(vec![
         Span::styled(" GPU Trace Viewer ", Style::new().fg(Color::Black).bg(Color::Cyan).bold()),
-        Span::raw("  "),
-        Span::styled("Stream: ", Style::new().fg(Color::DarkGray)),
-        Span::styled(
-            format!("cuda:{}", app.active_stream()),
-            Style::new().fg(Color::Yellow).bold(),
-        ),
-        Span::raw("  "),
-        Span::styled("Lane: ", Style::new().fg(Color::DarkGray)),
-        Span::styled(
-            format!("{} ({}/{})", lane_kind, app.active_lane + 1, app.lanes.len()),
-            Style::new().fg(Color::Cyan),
-        ),
-        Span::raw("  "),
-        Span::styled("Sel: ", Style::new().fg(Color::DarkGray)),
-        Span::styled(
-            if app.active_lane_len() == 0 {
-                "-/-".to_string()
-            } else {
-                format!("{}/{}", app.selected_item + 1, app.active_lane_len())
-            },
-            Style::new().fg(Color::Yellow),
-        ),
-        Span::raw("  "),
-        Span::styled("Zoom: ", Style::new().fg(Color::DarkGray)),
-        Span::styled(app.zoom_label(), Style::new().fg(Color::Magenta).bold()),
         Span::styled(
             if app.traces.len() == 2 {
                 "  [/] search  [Tab] lane  [A/D] item  [W/S] zoom  [E] export  [G] diff/normal  [Q] quit"

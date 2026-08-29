@@ -279,8 +279,8 @@ fn event_loop(
     let mut clipboard = crate::clipboard::ClipboardManager::new();
     loop {
         let term_height = terminal.size()?.height as usize;
-        let lane_rows = term_height.saturating_sub(1 + 12 + 3);
-        app.ensure_active_lane_visible(lane_rows.max(1));
+        let lane_rows = term_height.saturating_sub(1 + 12 + 3).max(1);
+        app.clamp_lane_view_offset(lane_rows);
 
         terminal.draw(|frame| {
             ui::render(frame, app);
@@ -350,6 +350,7 @@ fn event_loop(
                             KeyCode::Char(c) => app.search_push(c),
                             _ => {}
                         }
+                        app.ensure_active_lane_visible(lane_rows);
                         continue;
                     }
                     app.status = None;
@@ -369,9 +370,11 @@ fn event_loop(
                         }
                         KeyCode::Char('a') | KeyCode::Char('A') | KeyCode::Left => {
                             app.prev_item();
+                            app.ensure_active_lane_visible(lane_rows);
                         }
                         KeyCode::Char('d') | KeyCode::Char('D') | KeyCode::Right => {
                             app.next_item();
+                            app.ensure_active_lane_visible(lane_rows);
                         }
                         KeyCode::Char('w') | KeyCode::Char('W') | KeyCode::Up => {
                             app.zoom_in();
@@ -381,9 +384,11 @@ fn event_loop(
                         }
                         KeyCode::Tab => {
                             app.next_lane();
+                            app.ensure_active_lane_visible(lane_rows);
                         }
                         KeyCode::BackTab => {
                             app.prev_lane();
+                            app.ensure_active_lane_visible(lane_rows);
                         }
                         _ => {}
                     }
@@ -393,9 +398,10 @@ fn event_loop(
                     match m.kind {
                         MouseEventKind::Down(MouseButton::Left) => {
                             app.click_select(m.column, m.row);
+                            app.ensure_active_lane_visible(lane_rows);
                         }
-                        MouseEventKind::ScrollUp => app.zoom_in(),
-                        MouseEventKind::ScrollDown => app.zoom_out(),
+                        MouseEventKind::ScrollUp => app.scroll_lanes_up(1),
+                        MouseEventKind::ScrollDown => app.scroll_lanes_down(1, lane_rows),
                         _ => {}
                     }
                 }
