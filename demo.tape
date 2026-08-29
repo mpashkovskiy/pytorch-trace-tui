@@ -1,76 +1,56 @@
-Output usage.gif
+Output demo.gif
 Set FontSize 13
 Set Width 1024
-Set Height 480
+Set Height 380
 Set Padding 10
-Sleep 1ms
-Escape
-Type "[200~target/x86_64-unknown-linux-musl/release/pytorch-trace-tui"
-Escape
-Type "[201~"
+
+# --- launch: pick one trace from the recursive picker ---
+Sleep 800ms
+Type@15ms "target/x86_64-unknown-linux-musl/release/pytorch-trace-tui"
 Enter
 Sleep 500ms
 Type "1"
 Enter
-Sleep 1s
-Escape
-Type "[<35;38;4M"
-Escape
-Type "[<35;36;4M"
-Escape
-Type "[<35;34;4M"
-Escape
-Type "[<35;33;4M"
-Escape
-Type "[<35;32;4M"
-Escape
-Type "[<0;32;4M"
-Escape
-Type "[<0;32;4mwwwwwwwwwww"
-Sleep 500ms
-Type "/"
-Sleep 500ms
-Type "moe"
-Sleep 2s
-Type "_"
-Sleep 2s
-Type "gemm"
-Sleep 2s
-Escape
-Type "wwwwwwwww"
-Sleep 1s
-Type "a"
-Sleep 1s
-Type "a"
-Sleep 1s
-Type "d"
-Sleep 1s
-Type "d"
-Sleep 1s
-Type "d"
-Sleep 1s
-Type "a"
-Sleep 2s
-Type "n"
-Sleep 3s
-Escape
-Type "[B"
-Escape
-Type "[B"
-Escape
-Type "[B"
-Sleep 1s
-Type "y"
-Sleep 1s
-Type "q"
-Sleep 500ms
-Type "head"
-Sleep 500ms
-Type " -5 "
-Sleep 500ms
-Type "ker"
-Tab
-Sleep 500ms
-Enter
-Sleep 2.5s
+Sleep 1500ms
 
+# --- zoom into a busy region (W = in) ---
+Type@90ms "wwwwwwwwwwwwwwww"
+Sleep 800ms
+
+# --- incremental name search (/) ---
+Type "/"
+Sleep 1s
+Type@120ms "moe"
+Sleep 1s
+Type "_"
+Sleep 1s
+Type@120ms "gemm"
+Sleep 1s
+Escape
+Sleep 500ms
+
+# --- zoom in further, then step through kernels (A/D) ---
+Type@90ms "wwww"
+Sleep 800ms
+Type@500ms "aa"
+Sleep 500ms
+Type@500ms "ddda"
+Sleep 1500ms
+
+# --- kernel sequence popup (N), scroll it, copy (Y) ---
+Type "n"
+Sleep 1200ms
+Down@200ms 3
+Sleep 800ms
+Type "y"
+Sleep 1500ms
+Escape
+Sleep 500ms
+
+# --- quit, then preview the exported kernel-sequence CSV ---
+Type "q"
+Sleep 800ms
+Type@40ms "head -5 kernel-sequence-*.csv"
+Sleep 400ms
+Enter
+Sleep 2500ms

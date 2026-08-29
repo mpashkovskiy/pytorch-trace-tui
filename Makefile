@@ -19,14 +19,14 @@ install-deps: ## Install vhs + ffmpeg (Debian/Ubuntu, Charm apt repo)
 	sudo apt-get install -y vhs ffmpeg
 	vhs --version && ffmpeg -version | head -1
 
-build: ## Build the release binary
+target/x86_64-unknown-linux-musl/release/pytorch-trace-tui: ## Build the release binary
 	cargo build --release
 
-tape: build ## Record a new demo.tape interactively (Ctrl-D to finish)
+tape: target/x86_64-unknown-linux-musl/release/pytorch-trace-tui ## Record a new demo.tape interactively (Ctrl-D to finish)
 	vhs record --shell $(REC_SHELL) > $(TAPE)
 
 export VHS_NO_SANDBOX=1
-gif: build ## Render demo.tape -> usage.gif
+gif: target/x86_64-unknown-linux-musl/release/pytorch-trace-tui ## Render demo.tape -> usage.gif
 	vhs $(TAPE)
 
 clean-gif: ## Remove the generated usage.gif

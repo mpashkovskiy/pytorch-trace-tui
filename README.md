@@ -1,6 +1,6 @@
 # pytorch-trace-tui
 
-![](usage.gif)
+![](demo.gif)
 
 A terminal UI for exploring **GPU kernels** in PyTorch profiler traces, rendered
 Perfetto-style as horizontal timeline lanes — one lane per CUDA stream, all
