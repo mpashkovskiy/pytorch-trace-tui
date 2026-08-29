@@ -7,6 +7,7 @@
 # PyTorch profiler traces (large binary data)
 *.pt.trace.json
 *.pt.trace.json.gz
+*.csv
 
 # OS / editor cruft
 .DS_Store
