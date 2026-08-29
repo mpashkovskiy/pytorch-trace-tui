@@ -1,4 +1,3 @@
-Output demo.gif
 Set FontSize 13
 Set Width 1024
 Set Height 380
