@@ -52,6 +52,48 @@ fn trace_label(path: &str, _index: usize) -> String {
     mcp_core::trace_display_label(path)
 }
 
+/// Loads several traces concurrently and returns them in the original path
+/// order paired with their display labels. Order is a correctness requirement:
+/// `App::new_multi` assigns each trace's `trace_id` by this position.
+fn load_traces_parallel(paths: &[String]) -> Result<Vec<(String, trace::Trace)>> {
+    load_traces_with(paths, |path| trace::parse_trace(path))
+}
+
+/// Order-preserving parallel loader parameterised by the per-path parse function
+/// so tests can exercise ordering and error propagation without huge fixtures.
+fn load_traces_with<F>(paths: &[String], parse: F) -> Result<Vec<(String, trace::Trace)>>
+where
+    F: Fn(&str) -> Result<trace::Trace> + Sync,
+{
+    let mut slots: Vec<Option<Result<trace::Trace>>> = (0..paths.len()).map(|_| None).collect();
+
+    std::thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(paths.len());
+        for (index, slot) in slots.iter_mut().enumerate() {
+            let path = &paths[index];
+            let parse = &parse;
+            handles.push(scope.spawn(move || {
+                *slot = Some(
+                    parse(path).with_context(|| format!("Failed to load trace: {}", path)),
+                );
+            }));
+        }
+        for handle in handles {
+            handle
+                .join()
+                .map_err(|_| anyhow::anyhow!("trace loader thread panicked"))?;
+        }
+        Ok::<(), anyhow::Error>(())
+    })?;
+
+    let mut labelled = Vec::with_capacity(paths.len());
+    for (index, slot) in slots.into_iter().enumerate() {
+        let trace = slot.expect("every slot is filled by its worker")?;
+        labelled.push((trace_label(&paths[index], index), trace));
+    }
+    Ok(labelled)
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
@@ -69,16 +111,12 @@ fn main() -> Result<()> {
         cli.traces
     };
 
-    let mut labelled: Vec<(String, trace::Trace)> = Vec::new();
-    let mut total_kernels = 0usize;
-    let mut total_annotations = 0usize;
-    for (index, path) in paths.iter().enumerate() {
-        let trace = trace::parse_trace(path)
-            .with_context(|| format!("Failed to load trace: {}", path))?;
-        total_kernels += trace.kernels.len();
-        total_annotations += trace.annotations.len();
-        labelled.push((trace_label(path, index), trace));
+    if paths.len() > 1 {
+        eprintln!("Loading {} traces in parallel...", paths.len());
     }
+    let labelled = load_traces_parallel(&paths)?;
+    let total_kernels: usize = labelled.iter().map(|(_, t)| t.kernels.len()).sum();
+    let total_annotations: usize = labelled.iter().map(|(_, t)| t.annotations.len()).sum();
 
     if total_kernels == 0 {
         println!("No GPU kernels found in trace file(s): {}", paths.join(", "));
@@ -443,7 +481,88 @@ fn sequence_viewport(term_height: usize, app: &App) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_selection;
+    use super::{load_traces_with, parse_selection};
+    use crate::trace::{KernelEvent, Trace};
+
+    fn kernel(name: &str) -> KernelEvent {
+        KernelEvent {
+            name: name.into(),
+            cat: "kernel".into(),
+            ts: 0.0,
+            dur: 1.0,
+            device: 0,
+            stream: 0,
+            grid: None,
+            block: None,
+            shared_memory: None,
+            registers_per_thread: None,
+            correlation: None,
+            trace_id: 0,
+        }
+    }
+
+    #[test]
+    fn load_traces_with_preserves_input_order() {
+        let paths: Vec<String> = vec!["a".into(), "b".into(), "c".into()];
+        let out = load_traces_with(&paths, |p| {
+            Ok(Trace {
+                kernels: vec![kernel(p)],
+                annotations: vec![],
+            })
+        })
+        .expect("all parse ok");
+        assert_eq!(out.len(), 3);
+        assert_eq!(out[0].1.kernels[0].name, "a");
+        assert_eq!(out[1].1.kernels[0].name, "b");
+        assert_eq!(out[2].1.kernels[0].name, "c");
+    }
+
+    #[test]
+    fn load_traces_with_order_independent_of_completion() {
+        use std::time::Duration;
+        // Path "a" is intentionally slower; result must still land at index 0.
+        let paths: Vec<String> = vec!["a".into(), "b".into()];
+        let out = load_traces_with(&paths, |p| {
+            if p == "a" {
+                std::thread::sleep(Duration::from_millis(40));
+            }
+            Ok(Trace {
+                kernels: vec![kernel(p)],
+                annotations: vec![],
+            })
+        })
+        .expect("all parse ok");
+        assert_eq!(out[0].1.kernels[0].name, "a");
+        assert_eq!(out[1].1.kernels[0].name, "b");
+    }
+
+    #[test]
+    fn load_traces_with_single_trace() {
+        let paths: Vec<String> = vec!["only".into()];
+        let out = load_traces_with(&paths, |p| {
+            Ok(Trace {
+                kernels: vec![kernel(p)],
+                annotations: vec![],
+            })
+        })
+        .expect("single trace ok");
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].1.kernels[0].name, "only");
+    }
+
+    #[test]
+    fn load_traces_with_propagates_error_with_path_context() {
+        let paths: Vec<String> = vec!["good".into(), "bad".into()];
+        let err = load_traces_with(&paths, |p| {
+            if p == "bad" {
+                anyhow::bail!("boom");
+            }
+            Ok(Trace::default())
+        })
+        .expect_err("bad path should error");
+        let msg = format!("{:#}", err);
+        assert!(msg.contains("bad"), "error mentions failing path: {}", msg);
+    }
 
     #[test]
     fn single_number() {
