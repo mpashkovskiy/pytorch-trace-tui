@@ -56,7 +56,7 @@ fn trace_label(path: &str, _index: usize) -> String {
 /// order paired with their display labels. Order is a correctness requirement:
 /// `App::new_multi` assigns each trace's `trace_id` by this position.
 fn load_traces_parallel(paths: &[String]) -> Result<Vec<(String, trace::Trace)>> {
-    load_traces_with(paths, |path| trace::parse_trace(path))
+    load_traces_with(paths, trace::parse_trace)
 }
 
 /// Order-preserving parallel loader parameterised by the per-path parse function
@@ -405,6 +405,10 @@ fn event_loop(
                         }
                         KeyCode::Char('g') | KeyCode::Char('G') => {
                             app.toggle_align_mode();
+                        }
+                        KeyCode::Char('c') | KeyCode::Char('C') => {
+                            app.toggle_collapse();
+                            app.ensure_active_lane_visible(lane_rows);
                         }
                         KeyCode::Char('a') | KeyCode::Char('A') | KeyCode::Left => {
                             app.prev_item();

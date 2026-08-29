@@ -866,6 +866,42 @@ impl App {
         }
     }
 
+    /// Collapse stats for the selected kernel, present only when collapse is on
+    /// and the selection is a representative of a repeated block.
+    pub fn selected_kernel_collapse_stats(&self) -> Option<KernelCollapseStats> {
+        if !self.collapse_enabled {
+            return None;
+        }
+        let lane = self.lanes.get(self.active_lane)?;
+        if lane.is_annotations() {
+            return None;
+        }
+        let idx = *lane.item_indices().get(self.selected_item)?;
+        self.kernel_collapse_stats
+            .get(idx)
+            .copied()
+            .flatten()
+            .filter(|s| s.repeat_count > 1)
+    }
+
+    /// Collapse stats for the selected annotation, present only when collapse is
+    /// on and the selection is a representative of a repeated block.
+    pub fn selected_annotation_collapse_stats(&self) -> Option<AnnotationCollapseStats> {
+        if !self.collapse_enabled {
+            return None;
+        }
+        let lane = self.lanes.get(self.active_lane)?;
+        if !lane.is_annotations() {
+            return None;
+        }
+        let idx = *lane.item_indices().get(self.selected_item)?;
+        self.annotation_collapse_stats
+            .get(idx)
+            .copied()
+            .flatten()
+            .filter(|s| s.repeat_count > 1)
+    }
+
     // ── Item navigation (A/D) — no wrap, matches previous kernel navigation ──
 
     pub fn prev_item(&mut self) {
