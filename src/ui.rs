@@ -159,16 +159,31 @@ fn render_sequence_popup(frame: &mut Frame, area: Rect, app: &App) {
 }
 
 fn render_header(frame: &mut Frame, area: Rect, app: &App) {
+    let collapse_key = if app.collapse_enabled {
+        "[C] expand"
+    } else {
+        "[C] collapse"
+    };
+    let tail = if app.traces.len() == 2 {
+        "  [G] diff/normal  [Q] quit"
+    } else {
+        "  [Q] quit"
+    };
     let line = Line::from(vec![
         Span::styled(" GPU Trace Viewer ", Style::new().fg(Color::Black).bg(Color::Cyan).bold()),
         Span::styled(
-            if app.traces.len() == 2 {
-                "  [/] search  [Tab] lane  [A/D] item  [W/S] zoom  [E] export  [C] collapse  [G] diff/normal  [Q] quit"
-            } else {
-                "  [/] search  [Tab] lane  [A/D] item  [W/S] zoom  [E] export  [C] collapse  [Q] quit"
-            },
+            "  [/] search  [Tab] lane  [A/D] item  [W/S] zoom  [E] export  ",
             Style::new().fg(Color::DarkGray),
         ),
+        Span::styled(
+            collapse_key,
+            if app.collapse_enabled {
+                Style::new().fg(Color::Black).bg(Color::Magenta).bold()
+            } else {
+                Style::new().fg(Color::DarkGray)
+            },
+        ),
+        Span::styled(tail, Style::new().fg(Color::DarkGray)),
     ]);
 
     if let Some(status) = app.status.as_deref() {
@@ -208,7 +223,7 @@ fn render_header(frame: &mut Frame, area: Rect, app: &App) {
 }
 
 fn render_lane(frame: &mut Frame, area: Rect, app: &mut App) {
-    let title = match app.mode_label() {
+    let base_title = match app.mode_label() {
         Some(mode) => format!(" {} traces — {} ", app.traces.len(), mode),
         None if app.traces.len() > 1 => format!(" {} traces ", app.traces.len()),
         None => format!(
@@ -217,10 +232,20 @@ fn render_lane(frame: &mut Frame, area: Rect, app: &mut App) {
             app.active_stream()
         ),
     };
+    let title = if app.collapse_enabled {
+        format!("{}▲ COLLAPSED ", base_title)
+    } else {
+        base_title
+    };
+    let border_color = if app.collapse_enabled {
+        Color::Magenta
+    } else {
+        Color::Blue
+    };
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
-        .border_style(Style::new().fg(Color::Blue))
+        .border_style(Style::new().fg(border_color))
         .title(title)
         .title_style(Style::new().fg(Color::Cyan).bold());
 
