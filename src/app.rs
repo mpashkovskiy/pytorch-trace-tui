@@ -236,6 +236,20 @@ pub struct App {
     pub kernel_representative: Vec<Option<usize>>,
     /// For a hidden annotation, the flat index of its representative.
     pub annotation_representative: Vec<Option<usize>>,
+    /// Cached full-resolution diff alignment (positions + statuses + annotation
+    /// spans) for raw mode, computed lazily the first time the user views raw +
+    /// diff. `None` until then; invalidated (set to `None`) whenever align mode
+    /// changes. Keeps the expensive full Myers diff off the default startup path.
+    raw_diff_cache: Option<AlignmentSnapshot>,
+}
+
+/// A frozen copy of the render-override vectors produced by a full-resolution
+/// diff alignment, keyed by flat index so it can be restored wholesale.
+#[derive(Debug, Clone)]
+struct AlignmentSnapshot {
+    kernel_render_overrides: Vec<Option<f64>>,
+    annotation_render_overrides: Vec<Option<(f64, f64)>>,
+    kernel_diff_status: Vec<Option<KernelDiff>>,
 }
 
 impl App {
@@ -332,6 +346,7 @@ impl App {
             kernel_duration_overrides: vec![None; kernel_count_for_stats],
             kernel_representative: vec![None; kernel_count_for_stats],
             annotation_representative: vec![None; annotation_count_for_stats],
+            raw_diff_cache: None,
         };
         app.raw_lanes = app.lanes.clone();
         app.build_collapse_groups();
@@ -513,6 +528,7 @@ impl App {
             AlignMode::Diff => AlignMode::Normal,
             AlignMode::Normal => AlignMode::Diff,
         };
+        self.raw_diff_cache = None;
         self.recompute_alignment();
         true
     }
@@ -536,18 +552,61 @@ impl App {
         for s in &mut self.kernel_diff_status {
             *s = None;
         }
+        for d in &mut self.kernel_duration_overrides {
+            *d = None;
+        }
 
         if trace_count != 2 || self.align_mode != AlignMode::Diff {
+            if self.collapse_enabled {
+                self.apply_collapse_render();
+            }
             return;
         }
 
+        if self.collapse_enabled {
+            // Diff only the visible representative kernels — a ~15× smaller input
+            // than the full raw sequence — then lay out representative blocks with
+            // median durations. The full raw diff is deferred to `raw_diff_cache`.
+            self.diff_align(&normal_off, |app, stream, tid| {
+                app.visible_stream_kernel_indices(tid, stream)
+            });
+            self.apply_collapse_render();
+        } else {
+            // Raw view: restore the cached full-resolution diff, computing it once
+            // on first use so the expensive full Myers diff stays off startup.
+            if self.raw_diff_cache.is_none() {
+                self.diff_align(&normal_off, |app, stream, tid| {
+                    stream_kernel_indices(&app.kernels, tid, stream)
+                });
+                self.raw_diff_cache = Some(AlignmentSnapshot {
+                    kernel_render_overrides: self.kernel_render_overrides.clone(),
+                    annotation_render_overrides: self.annotation_render_overrides.clone(),
+                    kernel_diff_status: self.kernel_diff_status.clone(),
+                });
+            } else {
+                let snap = self.raw_diff_cache.clone().expect("cache present");
+                self.kernel_render_overrides = snap.kernel_render_overrides;
+                self.annotation_render_overrides = snap.annotation_render_overrides;
+                self.kernel_diff_status = snap.kernel_diff_status;
+            }
+        }
+    }
+
+    /// Runs the per-stream Myers diff over the kernel index sets chosen by
+    /// `pick` (all raw kernels, or only the visible collapsed representatives),
+    /// writing render positions + diff status and carrying annotations along the
+    /// resulting per-stream `TimeMap`.
+    fn diff_align<F>(&mut self, normal_off: &[f64], pick: F)
+    where
+        F: Fn(&App, u64, usize) -> Vec<usize>,
+    {
         let mut streams: Vec<u64> = self.kernels.iter().map(|k| k.stream).collect();
         streams.sort_unstable();
         streams.dedup();
 
         for stream in streams {
-            let idx0 = stream_kernel_indices(&self.kernels, 0, stream);
-            let idx1 = stream_kernel_indices(&self.kernels, 1, stream);
+            let idx0 = pick(self, stream, 0);
+            let idx1 = pick(self, stream, 1);
             if idx0.is_empty() || idx1.is_empty() {
                 continue;
             }
@@ -565,10 +624,33 @@ impl App {
             self.remap_stream_annotations(stream, 0, &map0);
             self.remap_stream_annotations(stream, 1, &map1);
         }
+    }
 
-        if self.collapse_enabled {
-            self.apply_collapse_render();
-        }
+    /// Flat kernel indices for one trace's one stream that are VISIBLE in the
+    /// collapsed lane set (representatives + un-bracketed kernels), sorted by raw
+    /// timestamp. This is the reduced input diffed in collapsed mode.
+    fn visible_stream_kernel_indices(&self, trace_id: usize, stream: u64) -> Vec<usize> {
+        let mut idx: Vec<usize> = self
+            .collapsed_lanes
+            .iter()
+            .filter_map(|l| match l {
+                Lane::Kernels {
+                    stream_id,
+                    trace_id: tid,
+                    item_indices,
+                } if *stream_id == stream && *tid == trace_id => Some(item_indices),
+                _ => None,
+            })
+            .flatten()
+            .copied()
+            .collect();
+        idx.sort_by(|&a, &b| {
+            self.kernels[a]
+                .ts
+                .partial_cmp(&self.kernels[b].ts)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        idx
     }
 
     /// Detects repeated annotation blocks and populates every collapse-related
@@ -3469,6 +3551,95 @@ mod tests {
             app.annotation_render_end(c1)
         );
         assert!(app.annotation_render_end(c1) >= app.annotation_render_ts(c1));
+    }
+
+    // ── Collapsed-sequence diff optimization ─────────────────────────────────
+
+    /// Two traces each with `reps` identical decode blocks (annotation "decode"
+    /// bracketing a `p`/`q` kernel pair) on stream 1, so the collapsed view keeps
+    /// one representative block per trace and the diff runs on the reduced input.
+    fn two_trace_repeated(reps0: usize, reps1: usize) -> (Trace, Trace) {
+        let build = |reps: usize| -> Trace {
+            let mut kernels = Vec::new();
+            let mut annotations = Vec::new();
+            let mut t = 0.0;
+            for _ in 0..reps {
+                kernels.push(kd(1, t, "p", 10.0));
+                kernels.push(kd(1, t + 20.0, "q", 4.0));
+                annotations.push(ann_dur(1, t, 40.0, "decode"));
+                t += 50.0;
+            }
+            trace_of(kernels, annotations)
+        };
+        (build(reps0), build(reps1))
+    }
+
+    #[test]
+    fn test_collapsed_diff_marks_only_visible_reps() {
+        // Both traces share the decode phase; collapsed diff should find the
+        // representative p/q matched (no Added/Deleted) despite differing counts.
+        let (t0, t1) = two_trace_repeated(15, 12);
+        let app = App::new_multi(vec![("T0".into(), t0), ("T1".into(), t1)]);
+        assert_eq!(app.align_mode, AlignMode::Diff);
+        assert!(app.collapse_enabled, "collapsed is default");
+        // Representative p/q on both traces are matched (shared phase), not diffed.
+        for tid in 0..2 {
+            let p = kidx(&app, tid, "p", 0.0);
+            assert_eq!(app.kernel_diff(p), None, "matched representative p (t{tid})");
+        }
+    }
+
+    #[test]
+    fn test_raw_diff_computed_lazily_on_toggle_off() {
+        // Trace 1 has an extra decode rep (13 vs 12). In RAW mode the full diff
+        // must mark the surplus trace-1 kernels — proving the lazy full diff runs.
+        let (t0, t1) = two_trace_repeated(12, 13);
+        let mut app = App::new_multi(vec![("T0".into(), t0), ("T1".into(), t1)]);
+        // Cache not yet built while collapsed.
+        assert!(app.raw_diff_cache.is_none());
+        // Toggle to raw view.
+        assert!(app.toggle_collapse());
+        assert!(!app.collapse_enabled);
+        assert!(app.raw_diff_cache.is_some(), "raw diff cached on first raw view");
+        // The 13th decode block on trace 1 is an insertion -> its p/q are Added.
+        let surplus_p = app
+            .kernels
+            .iter()
+            .enumerate()
+            .filter(|(_, k)| k.trace_id == 1 && k.name == "p")
+            .map(|(i, _)| i)
+            .last()
+            .unwrap();
+        assert_eq!(
+            app.kernel_diff(surplus_p),
+            Some(KernelDiff::Added),
+            "surplus trace-1 decode kernel is Added in the full raw diff"
+        );
+    }
+
+    #[test]
+    fn test_raw_diff_cache_reused_on_round_trip() {
+        let (t0, t1) = two_trace_repeated(12, 13);
+        let mut app = App::new_multi(vec![("T0".into(), t0), ("T1".into(), t1)]);
+        app.toggle_collapse(); // -> raw, builds cache
+        let cached = app.raw_diff_cache.clone().expect("cache built");
+        app.toggle_collapse(); // -> collapsed
+        app.toggle_collapse(); // -> raw again, must reuse cache
+        let reused = app.raw_diff_cache.clone().expect("cache still present");
+        assert_eq!(
+            cached.kernel_diff_status, reused.kernel_diff_status,
+            "raw diff identical across round-trip"
+        );
+    }
+
+    #[test]
+    fn test_align_mode_toggle_invalidates_raw_diff_cache() {
+        let (t0, t1) = two_trace_repeated(12, 13);
+        let mut app = App::new_multi(vec![("T0".into(), t0), ("T1".into(), t1)]);
+        app.toggle_collapse(); // raw, builds cache
+        assert!(app.raw_diff_cache.is_some());
+        app.toggle_align_mode();
+        assert!(app.raw_diff_cache.is_none(), "align-mode change clears the cache");
     }
 
     // S2: normal mode zero-bases every trace to the common start; both traces'
