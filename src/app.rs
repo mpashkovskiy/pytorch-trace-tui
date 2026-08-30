@@ -1579,18 +1579,21 @@ impl TimeMap {
         if t >= last_raw {
             return t + (last_render - last_raw);
         }
-        for w in self.controls.windows(2) {
-            let (raw_i, render_i) = w[0];
-            let (raw_j, render_j) = w[1];
-            if raw_i <= t && t <= raw_j {
-                if raw_j == raw_i {
-                    return t + (render_i - raw_i);
-                }
-                let alpha = (t - raw_i) / (raw_j - raw_i);
-                return render_i + alpha * (render_j - render_i);
-            }
+        // Controls are sorted by raw ts (see `new`), so binary-search the
+        // enclosing segment instead of scanning — this runs once per annotation,
+        // so a linear scan here is O(annotations × controls).
+        let j = self
+            .controls
+            .partition_point(|&(raw, _)| raw <= t)
+            .max(1)
+            .min(n - 1);
+        let (raw_i, render_i) = self.controls[j - 1];
+        let (raw_j, render_j) = self.controls[j];
+        if raw_j == raw_i {
+            return t + (render_i - raw_i);
         }
-        t + (last_render - last_raw)
+        let alpha = (t - raw_i) / (raw_j - raw_i);
+        render_i + alpha * (render_j - render_i)
     }
 }
 
