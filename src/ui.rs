@@ -772,17 +772,18 @@ mod tests {
             t += 40.0;
         }
         let mut app = App::new(Trace { kernels, annotations });
-        let ann_lane = app.lanes.iter().position(|l| l.is_annotations()).unwrap();
 
-        // Un-collapsed: no ×N suffix.
-        let raw_spans = build_lane(&app, ann_lane, 0.0, 200.0, 80);
-        let raw_text: String = raw_spans.iter().map(|s| s.content.as_ref()).collect();
-        assert!(!raw_text.contains('×'), "no suffix before collapse");
-
-        app.toggle_collapse();
+        // Collapse is the default view: the label carries the ×N suffix.
         let ann_lane = app.lanes.iter().position(|l| l.is_annotations()).unwrap();
         let col_spans = build_lane(&app, ann_lane, 0.0, 40.0, 120);
         let col_text: String = col_spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(col_text.contains("×3"), "collapsed label shows ×3: {col_text:?}");
+
+        // Toggle off → raw view has no ×N suffix.
+        app.toggle_collapse();
+        let ann_lane = app.lanes.iter().position(|l| l.is_annotations()).unwrap();
+        let raw_spans = build_lane(&app, ann_lane, 0.0, 200.0, 80);
+        let raw_text: String = raw_spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(!raw_text.contains('×'), "no suffix after toggling off");
     }
 }

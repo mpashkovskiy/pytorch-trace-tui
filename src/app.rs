@@ -4,15 +4,15 @@ use std::collections::HashMap;
 const ZOOM_MIN: f64 = 0.1;
 const ZOOM_FACTOR: f64 = 1.5;
 
-/// Identity of a repeat group: same trace, stream, annotation name, and the
-/// exact ordered sequence of kernel names bracketed by the annotation. Only
-/// blocks matching on all four fold together.
+/// Identity of a repeat group: same trace, stream, and annotation name. Blocks
+/// sharing a name fold together even when their kernel sequences drift (e.g.
+/// data-dependent MoE routing), so a phase like decode collapses to one
+/// representative regardless of per-iteration kernel-count variation.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct CollapseKey {
     trace_id: usize,
     stream: u64,
     name: String,
-    signature: Vec<String>,
 }
 
 /// One annotation instance and the flat kernel indices it brackets, in order.
@@ -335,6 +335,16 @@ impl App {
         };
         app.raw_lanes = app.lanes.clone();
         app.build_collapse_groups();
+        // Collapsed (grouped) view is the default rendering strategy.
+        if !app.collapsed_lanes.is_empty() {
+            app.collapse_enabled = true;
+            app.lanes = app.collapsed_lanes.clone();
+            app.active_lane = app
+                .lanes
+                .iter()
+                .position(|l| !l.is_annotations())
+                .unwrap_or(0);
+        }
         app.recompute_alignment();
         app.clamp_selected_item();
         app
@@ -589,13 +599,10 @@ impl App {
                 if kernels.is_empty() {
                     continue;
                 }
-                let signature: Vec<String> =
-                    kernels.iter().map(|&ki| self.kernels[ki].name.clone()).collect();
                 let key = CollapseKey {
                     trace_id: *trace_id,
                     stream: *stream_id,
                     name: ann.name.clone(),
-                    signature,
                 };
                 let block = AnnotationBlock {
                     annotation: ann_idx,
@@ -629,10 +636,17 @@ impl App {
             });
 
             for pos in 0..block_len {
-                let durs: Vec<f64> = blocks.iter().map(|b| self.kernels[b.kernels[pos]].dur).collect();
+                let durs: Vec<f64> = blocks
+                    .iter()
+                    .filter_map(|b| b.kernels.get(pos).map(|&ki| self.kernels[ki].dur))
+                    .collect();
                 let rel_starts: Vec<f64> = blocks
                     .iter()
-                    .map(|b| self.kernels[b.kernels[pos]].ts - self.annotations[b.annotation].ts)
+                    .filter_map(|b| {
+                        b.kernels
+                            .get(pos)
+                            .map(|&ki| self.kernels[ki].ts - self.annotations[b.annotation].ts)
+                    })
                     .collect();
                 let rep_kernel = rep.kernels[pos];
                 self.kernel_collapse_stats[rep_kernel] = Some(KernelCollapseStats {
@@ -650,7 +664,8 @@ impl App {
                 self.annotation_representative[block.annotation] = Some(rep.annotation);
                 for (pos, &ki) in block.kernels.iter().enumerate() {
                     hidden_kernels.insert(ki);
-                    self.kernel_representative[ki] = Some(rep.kernels[pos]);
+                    let rep_kernel = rep.kernels.get(pos).copied().unwrap_or(rep.kernels[block_len - 1]);
+                    self.kernel_representative[ki] = Some(rep_kernel);
                 }
             }
         }
@@ -722,6 +737,9 @@ impl App {
             let Some(stats) = self.annotation_collapse_stats[ann_idx] else {
                 continue;
             };
+            if stats.repeat_count <= 1 {
+                continue;
+            }
             let (ann_start, _) = match self.annotation_render_overrides[ann_idx] {
                 Some(span) => span,
                 None => (self.annotations[ann_idx].ts, self.annotations[ann_idx].end_ts()),
@@ -733,6 +751,9 @@ impl App {
             let Some(stats) = self.kernel_collapse_stats[ki] else {
                 continue;
             };
+            if stats.repeat_count <= 1 {
+                continue;
+            }
             let Some(ann_idx) = stats.representative_annotation else {
                 continue;
             };
@@ -1288,10 +1309,20 @@ impl App {
     }
 
     /// CSV of every kernel in the active lane (raw timestamps, full fields), or
-    /// `None` when the active lane is not a kernel lane. Row order matches the
-    /// lane's on-screen order.
+    /// `None` when the active lane is not a kernel lane. Always exports the full
+    /// uncollapsed lane so a scripted/MCP dump never drops repeated blocks, even
+    /// when the collapsed view is active. Row order matches the raw lane order.
     pub fn lane_kernels_csv(&self) -> Option<String> {
-        let lane = self.lanes.get(self.active_lane)?;
+        let active = self.lanes.get(self.active_lane)?;
+        if active.is_annotations() {
+            return None;
+        }
+        let (stream, trace_id) = (active.stream_id(), active.trace_id());
+        let lane = self
+            .raw_lanes
+            .iter()
+            .find(|l| !l.is_annotations() && l.stream_id() == stream && l.trace_id() == trace_id)
+            .unwrap_or(active);
         let Lane::Kernels { item_indices, .. } = lane else {
             return None;
         };
@@ -4138,6 +4169,10 @@ mod tests {
     #[test]
     fn test_toggle_collapse_round_trip_identity() {
         let mut app = App::new(collapse_trace(15));
+        // Collapse is the default; toggle OFF to capture the raw baseline.
+        assert!(app.collapse_enabled, "collapse on by default");
+        assert!(app.toggle_collapse(), "toggle off");
+        assert!(!app.collapse_enabled);
         let before: Vec<Vec<usize>> =
             app.lanes.iter().map(|l| l.item_indices().to_vec()).collect();
         assert!(app.toggle_collapse(), "toggle on");
@@ -4156,6 +4191,8 @@ mod tests {
     #[test]
     fn test_toggle_collapse_remaps_hidden_selection() {
         let mut app = App::new(collapse_trace(15));
+        // Start from the raw view so a hidden repeat can be selected.
+        assert!(app.toggle_collapse(), "toggle off to raw");
         // Select a kernel lane and a hidden repeat (a later "p" kernel).
         let kernel_lane = app.lanes.iter().position(|l| !l.is_annotations()).unwrap();
         app.active_lane = kernel_lane;
@@ -4181,9 +4218,10 @@ mod tests {
     #[test]
     fn test_collapse_global_bounds_excludes_hidden() {
         let mut app = App::new(collapse_trace(15));
-        let (_, raw_end) = app.global_time_bounds();
-        app.toggle_collapse();
+        // Default is collapsed; capture collapsed bounds, then compare to raw.
         let (_, col_end) = app.global_time_bounds();
+        app.toggle_collapse();
+        let (_, raw_end) = app.global_time_bounds();
         assert!(
             col_end < raw_end,
             "collapsed bounds shrink: {} < {}",
