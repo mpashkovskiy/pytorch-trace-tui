@@ -6,6 +6,7 @@
 //! `limit`/`offset` bounds — traces are 800MB+ / millions of kernels, so an
 //! unbounded dump would overflow the caller's context.
 
+use crate::debug_log;
 use crate::mcp_core;
 use crate::mcp_core::Stage;
 use anyhow::Result;
@@ -16,6 +17,45 @@ use serde::Deserialize;
 
 #[derive(Debug, Clone)]
 pub struct TraceMcpServer;
+
+/// Logs one summarized argument under a request. Bodies are never passed here —
+/// only short scalars (path, stream, name, stage, offset/limit) — so huge/sensitive
+/// payloads stay out of the log.
+fn log_arg(label: &str, value: &str) {
+    debug_log::log_indented(&format!("{label}: {value}"));
+}
+
+fn log_loaded(path: &str, trace: &crate::trace::Trace) {
+    let size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+    debug_log::log_line(&format!("Loading trace: {}", debug_log::human_size(size)));
+    debug_log::log_line(&format!(
+        "Parsed {} kernels, {} annotations",
+        trace.kernels.len(),
+        trace.annotations.len()
+    ));
+}
+
+fn log_response(tool: &str, summary: &str) {
+    debug_log::log_line(&format!("MCP response: {tool} \u{2192} {summary}"));
+}
+
+fn log_error(tool: &str, msg: &str) {
+    debug_log::log_line(&format!("MCP error: {tool} \u{2192} {msg}"));
+}
+
+fn load_logged(tool: &str, path: &str) -> Result<crate::trace::Trace, String> {
+    match mcp_core::load(path) {
+        Ok(trace) => {
+            log_loaded(path, &trace);
+            Ok(trace)
+        }
+        Err(e) => {
+            let msg = e.to_string();
+            log_error(tool, &msg);
+            Err(msg)
+        }
+    }
+}
 
 /// Maps an optional stage filter string to `Option<Stage>`, rejecting values
 /// other than prefill/decode/mixed. Absent means "no filter" (all stages).
@@ -76,8 +116,18 @@ impl TraceMcpServer {
         description = "List PyTorch profiler traces (*.pt.trace.json.gz) in the current directory."
     )]
     fn list_traces(&self) -> Result<String, String> {
-        let names = mcp_core::list_traces_in_dir(".").map_err(|e| e.to_string())?;
-        Ok(names.join("\n"))
+        debug_log::log_line("MCP request: tools/call \u{2192} list_traces");
+        match mcp_core::list_traces_in_dir(".") {
+            Ok(names) => {
+                log_response("list_traces", &format!("{} traces", names.len()));
+                Ok(names.join("\n"))
+            }
+            Err(e) => {
+                let msg = e.to_string();
+                log_error("list_traces", &msg);
+                Err(msg)
+            }
+        }
     }
 
     #[tool(
@@ -85,9 +135,24 @@ impl TraceMcpServer {
         description = "Aggregate overview of a trace: kernel/annotation counts, streams, and total duration. Never returns per-kernel rows."
     )]
     fn summary(&self, Parameters(p): Parameters<PathParam>) -> Result<String, String> {
-        let trace = mcp_core::load(&p.path).map_err(|e| e.to_string())?;
+        debug_log::log_line("MCP request: tools/call \u{2192} summary");
+        log_arg("trace", &p.path);
+        let trace = load_logged("summary", &p.path)?;
         let s = mcp_core::summary(&trace);
-        serde_json::to_string_pretty(&s).map_err(|e| e.to_string())
+        match serde_json::to_string_pretty(&s) {
+            Ok(out) => {
+                log_response(
+                    "summary",
+                    &format!("{} kernels, {} streams", s.kernel_count, s.streams.len()),
+                );
+                Ok(out)
+            }
+            Err(e) => {
+                let msg = e.to_string();
+                log_error("summary", &msg);
+                Err(msg)
+            }
+        }
     }
 
     #[tool(
@@ -98,11 +163,23 @@ impl TraceMcpServer {
         &self,
         Parameters(p): Parameters<LaneParam>,
     ) -> Result<String, String> {
-        let stage = parse_stage_filter(&p.stage)?;
-        let trace = mcp_core::load(&p.path).map_err(|e| e.to_string())?;
-        Ok(mcp_core::lane_kernels_csv_for(
-            &trace, p.stream, p.offset, p.limit, stage,
-        ))
+        debug_log::log_line("MCP request: tools/call \u{2192} lane_kernels_csv");
+        log_arg("trace", &p.path);
+        log_arg("stream", &p.stream.to_string());
+        if let Some(stage) = &p.stage {
+            log_arg("stage", stage);
+        }
+        let stage = match parse_stage_filter(&p.stage) {
+            Ok(s) => s,
+            Err(msg) => {
+                log_error("lane_kernels_csv", &msg);
+                return Err(msg);
+            }
+        };
+        let trace = load_logged("lane_kernels_csv", &p.path)?;
+        let csv = mcp_core::lane_kernels_csv_for(&trace, p.stream, p.offset, p.limit, stage);
+        log_response("lane_kernels_csv", &debug_log::summarize_rows(&csv));
+        Ok(csv)
     }
 
     #[tool(
@@ -113,16 +190,34 @@ impl TraceMcpServer {
         &self,
         Parameters(p): Parameters<SequenceParam>,
     ) -> Result<String, String> {
-        let stage = parse_stage_filter(&p.stage)?;
-        let trace = mcp_core::load(&p.path).map_err(|e| e.to_string())?;
-        Ok(mcp_core::kernel_sequence_for(
+        debug_log::log_line("MCP request: tools/call \u{2192} kernel_sequence");
+        log_arg("trace", &p.path);
+        log_arg("stream", &p.stream.to_string());
+        log_arg("kernel", &p.kernel_name);
+        if let Some(stage) = &p.stage {
+            log_arg("stage", stage);
+        }
+        let stage = match parse_stage_filter(&p.stage) {
+            Ok(s) => s,
+            Err(msg) => {
+                log_error("kernel_sequence", &msg);
+                return Err(msg);
+            }
+        };
+        let trace = load_logged("kernel_sequence", &p.path)?;
+        let seq = mcp_core::kernel_sequence_for(
             &trace,
             p.stream,
             &p.kernel_name,
             p.offset,
             p.limit,
             stage,
-        ))
+        );
+        log_response(
+            "kernel_sequence",
+            &format!("{} kernels", debug_log::count_rows(&seq)),
+        );
+        Ok(seq)
     }
 
     #[tool(
@@ -133,8 +228,16 @@ impl TraceMcpServer {
         &self,
         Parameters(p): Parameters<StageSummaryParam>,
     ) -> Result<String, String> {
-        let trace = mcp_core::load(&p.path).map_err(|e| e.to_string())?;
-        Ok(mcp_core::stage_summary_for(&trace, p.stream))
+        debug_log::log_line("MCP request: tools/call \u{2192} stage_summary");
+        log_arg("trace", &p.path);
+        log_arg("stream", &p.stream.to_string());
+        let trace = load_logged("stage_summary", &p.path)?;
+        let out = mcp_core::stage_summary_for(&trace, p.stream);
+        log_response(
+            "stage_summary",
+            &format!("{} stages", debug_log::count_rows(&out)),
+        );
+        Ok(out)
     }
 }
 
