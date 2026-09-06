@@ -1,5 +1,6 @@
 mod app;
 mod clipboard;
+mod debug_log;
 mod mcp;
 mod mcp_core;
 mod trace;
@@ -46,6 +47,12 @@ struct Cli {
     /// TUI, exposing read-only bounded trace-analysis tools to an AI assistant.
     #[arg(long)]
     mcp: bool,
+
+    /// Write diagnostic logs to a file in the system temp directory
+    /// (e.g. /tmp/pytorch-trace-tui-*/debug.log) instead of stdout/stderr.
+    /// Opt-in; never writes to stdout, so MCP JSON-RPC output stays valid.
+    #[arg(long)]
+    debug: bool,
 }
 
 fn trace_label(path: &str, _index: usize) -> String {
@@ -55,9 +62,15 @@ fn trace_label(path: &str, _index: usize) -> String {
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
+    let log_path = debug_log::init(cli.debug)?;
+
     if cli.mcp {
         let rt = tokio::runtime::Runtime::new().context("failed to start async runtime")?;
         return rt.block_on(mcp::serve());
+    }
+
+    if let Some(p) = &log_path {
+        eprintln!("debug log: {}", p.display());
     }
 
     let paths: Vec<String> = if cli.traces.is_empty() {
@@ -172,7 +185,7 @@ fn select_trace_interactively() -> Result<Option<Vec<String>>> {
     for (i, (path, mtime, size)) in traces.iter().enumerate() {
         let label = mcp_core::trace_display_label(path);
         let dt = format_mtime(*mtime);
-        println!("  [{}] {}  {}  {}", i + 1, dt, human_size(*size), label);
+        println!("  [{}] {}  {}  {}", i + 1, dt, debug_log::human_size(*size), label);
     }
     print!(
         "Enter number(s) (e.g. 1 or '1 3' to overlay, 1-{}, or q to quit): ",
@@ -203,9 +216,7 @@ fn format_mtime(t: std::time::SystemTime) -> String {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
-    let s = secs % 60;
-    let m = (secs / 60) % 60;
-    let h = (secs / 3600) % 24;
+    let (h, m, s) = debug_log::hms_parts(secs);
     let days = secs / 86400;
     let mut y = 1970u32;
     let mut d = days;
@@ -226,17 +237,6 @@ fn format_mtime(t: std::time::SystemTime) -> String {
     }
     let day = rem + 1;
     format!("{:04}-{:02}-{:02} {:02}:{:02}:{:02}", y, mo, day, h, m, s)
-}
-
-fn human_size(bytes: u64) -> String {
-    const UNITS: &[&str] = &["B", "KB", "MB", "GB", "TB"];
-    let mut size = bytes as f64;
-    let mut unit = 0;
-    while size >= 1024.0 && unit < UNITS.len() - 1 {
-        size /= 1024.0;
-        unit += 1;
-    }
-    format!("{:.1} {}", size, UNITS[unit])
 }
 
 fn run_tui(mut app: App) -> Result<()> {
