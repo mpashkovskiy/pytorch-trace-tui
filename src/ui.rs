@@ -159,16 +159,31 @@ fn render_sequence_popup(frame: &mut Frame, area: Rect, app: &App) {
 }
 
 fn render_header(frame: &mut Frame, area: Rect, app: &App) {
+    let collapse_key = if app.collapse_enabled {
+        "[C] expand"
+    } else {
+        "[C] collapse"
+    };
+    let tail = if app.traces.len() == 2 {
+        "  [G] diff/normal  [Q] quit"
+    } else {
+        "  [Q] quit"
+    };
     let line = Line::from(vec![
         Span::styled(" GPU Trace Viewer ", Style::new().fg(Color::Black).bg(Color::Cyan).bold()),
         Span::styled(
-            if app.traces.len() == 2 {
-                "  [/] search  [Tab] lane  [A/D] item  [W/S] zoom  [E] export  [G] diff/normal  [Q] quit"
-            } else {
-                "  [/] search  [Tab] lane  [A/D] item  [W/S] zoom  [E] export  [Q] quit"
-            },
+            "  [/] search  [Tab] lane  [A/D] item  [W/S] zoom  [E] export  ",
             Style::new().fg(Color::DarkGray),
         ),
+        Span::styled(
+            collapse_key,
+            if app.collapse_enabled {
+                Style::new().fg(Color::Black).bg(Color::Magenta).bold()
+            } else {
+                Style::new().fg(Color::DarkGray)
+            },
+        ),
+        Span::styled(tail, Style::new().fg(Color::DarkGray)),
     ]);
 
     if let Some(status) = app.status.as_deref() {
@@ -208,7 +223,7 @@ fn render_header(frame: &mut Frame, area: Rect, app: &App) {
 }
 
 fn render_lane(frame: &mut Frame, area: Rect, app: &mut App) {
-    let title = match app.mode_label() {
+    let base_title = match app.mode_label() {
         Some(mode) => format!(" {} traces — {} ", app.traces.len(), mode),
         None if app.traces.len() > 1 => format!(" {} traces ", app.traces.len()),
         None => format!(
@@ -217,10 +232,20 @@ fn render_lane(frame: &mut Frame, area: Rect, app: &mut App) {
             app.active_stream()
         ),
     };
+    let title = if app.collapse_enabled {
+        format!("{}▲ COLLAPSED ", base_title)
+    } else {
+        base_title
+    };
+    let border_color = if app.collapse_enabled {
+        Color::Magenta
+    } else {
+        Color::Blue
+    };
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
-        .border_style(Style::new().fg(Color::Blue))
+        .border_style(Style::new().fg(border_color))
         .title(title)
         .title_style(Style::new().fg(Color::Cyan).bold());
 
@@ -446,7 +471,21 @@ fn build_annotation_lane(
         }
 
         let block_width = end_col.saturating_sub(start_col).max(1);
-        let label = pad_to(ellipsize(name, block_width), block_width);
+        let repeat = if app.collapse_enabled {
+            app.annotation_collapse_stats
+                .get(item_idx)
+                .copied()
+                .flatten()
+                .filter(|s| s.repeat_count > 1)
+                .map(|s| s.repeat_count)
+        } else {
+            None
+        };
+        let display = match repeat {
+            Some(n) => format!("{} ×{}", name, n),
+            None => name.to_string(),
+        };
+        let label = pad_to(ellipsize(&display, block_width), block_width);
         let style = if is_selected {
             Style::new().fg(Color::Black).bg(Color::White)
         } else {
@@ -494,7 +533,7 @@ fn render_info_panel(frame: &mut Frame, area: Rect, app: &App) {
 
     match item {
         SelectedTraceItem::Annotation(a) => {
-            let lines: Vec<Line> = vec![
+            let mut lines: Vec<Line> = vec![
                 Line::from(vec![kv_label("Name: "), kv_value(&a.name)]),
                 Line::from(vec![
                     kv_label("Stream: "),
@@ -511,11 +550,18 @@ fn render_info_panel(frame: &mut Frame, area: Rect, app: &App) {
                     kv_value(&format!("{:.3} μs", a.dur)),
                 ]),
             ];
+            if let Some(stats) = app.selected_annotation_collapse_stats() {
+                lines.push(collapse_line(vec![
+                    (kv_label("Repeat: "), kv_value(&format!("×{}", stats.repeat_count))),
+                    (kv_label("Median dur: "), kv_value(&format!("{:.3} μs", stats.median_dur))),
+                    (kv_label("Kernels: "), kv_value(&stats.kernel_count.to_string())),
+                ]));
+            }
             frame.render_widget(Paragraph::new(lines), inner);
         }
         SelectedTraceItem::Kernel(k) => {
             let na = || "N/A".to_string();
-            let lines: Vec<Line> = vec![
+            let mut lines: Vec<Line> = vec![
                 Line::from(vec![kv_label("Name: "), kv_value(&k.name)]),
                 Line::from(vec![
                     kv_label("Start: "),
@@ -546,9 +592,33 @@ fn render_info_panel(frame: &mut Frame, area: Rect, app: &App) {
                     kv_value(&k.correlation.map_or_else(na, |v| v.to_string())),
                 ]),
             ];
+            if let Some(stats) = app.selected_kernel_collapse_stats() {
+                lines.push(collapse_line(vec![
+                    (kv_label("Repeat: "), kv_value(&format!("×{}", stats.repeat_count))),
+                    (kv_label("Median dur: "), kv_value(&format!("{:.3} μs", stats.median_dur))),
+                    (
+                        kv_label("Kernel: "),
+                        kv_value(&format!("{}/{}", stats.position_in_block + 1, stats.block_len)),
+                    ),
+                ]));
+            }
             frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
         }
     }
+}
+
+/// Assembles one info-panel line from `(label, value)` span pairs separated by
+/// two spaces, used for the collapse stats row.
+fn collapse_line(pairs: Vec<(Span<'static>, Span<'static>)>) -> Line<'static> {
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    for (i, (label, value)) in pairs.into_iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::raw("  "));
+        }
+        spans.push(label);
+        spans.push(value);
+    }
+    Line::from(spans)
 }
 
 fn kernel_color(cat: &str, idx: usize) -> Color {
@@ -690,5 +760,55 @@ mod tests {
             colors.contains(&DIFF_ADDED),
             "green (added) cell visible over the wide matched reduce"
         );
+    }
+
+    // Collapsed repeated annotation renders a "×N" suffix on its label; a
+    // singleton (repeat_count==1) and the un-collapsed lane show no suffix.
+    #[test]
+    fn test_collapsed_annotation_label_shows_repeat_count() {
+        fn kn(ts: f64, name: &str, dur: f64) -> KernelEvent {
+            KernelEvent {
+                name: name.into(),
+                cat: "kernel".into(),
+                ts,
+                dur,
+                device: 0,
+                stream: 4,
+                grid: None,
+                block: None,
+                shared_memory: None,
+                registers_per_thread: None,
+                correlation: None,
+                trace_id: 0,
+            }
+        }
+        let mut kernels = Vec::new();
+        let mut annotations = Vec::new();
+        let mut t = 0.0;
+        for _ in 0..3 {
+            kernels.push(kn(t, "p", 10.0));
+            annotations.push(AnnotationEvent {
+                name: "decode".into(),
+                ts: t,
+                dur: 20.0,
+                stream: 4,
+                trace_id: 0,
+            });
+            t += 40.0;
+        }
+        let mut app = App::new(Trace { kernels, annotations });
+
+        // Collapse is the default view: the label carries the ×N suffix.
+        let ann_lane = app.lanes.iter().position(|l| l.is_annotations()).unwrap();
+        let col_spans = build_lane(&app, ann_lane, 0.0, 40.0, 120);
+        let col_text: String = col_spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(col_text.contains("×3"), "collapsed label shows ×3: {col_text:?}");
+
+        // Toggle off → raw view has no ×N suffix.
+        app.toggle_collapse();
+        let ann_lane = app.lanes.iter().position(|l| l.is_annotations()).unwrap();
+        let raw_spans = build_lane(&app, ann_lane, 0.0, 200.0, 80);
+        let raw_text: String = raw_spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(!raw_text.contains('×'), "no suffix after toggling off");
     }
 }

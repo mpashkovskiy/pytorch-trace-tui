@@ -1,7 +1,26 @@
 use crate::trace::{AnnotationEvent, KernelEvent, Trace};
+use std::collections::HashMap;
 
 const ZOOM_MIN: f64 = 0.1;
 const ZOOM_FACTOR: f64 = 1.5;
+
+/// Identity of a repeat group: same trace, stream, and annotation name. Blocks
+/// sharing a name fold together even when their kernel sequences drift (e.g.
+/// data-dependent MoE routing), so a phase like decode collapses to one
+/// representative regardless of per-iteration kernel-count variation.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct CollapseKey {
+    trace_id: usize,
+    stream: u64,
+    name: String,
+}
+
+/// One annotation instance and the flat kernel indices it brackets, in order.
+#[derive(Debug, Clone)]
+struct AnnotationBlock {
+    annotation: usize,
+    kernels: Vec<usize>,
+}
 
 /// A single navigable row on the timeline. Every lane — whether it holds GPU
 /// kernels or user annotations — behaves identically for navigation.
@@ -69,6 +88,30 @@ pub struct Sequence {
 #[derive(Debug, Clone)]
 pub struct TraceMeta {
     pub label: String,
+}
+
+/// Collapse statistics for a representative kernel (the one still rendered when
+/// its block's repeats are hidden). `median_dur` is the per-position median
+/// duration across every identical repetition of the block; `position_in_block`
+/// and `block_len` locate this kernel within its annotation block.
+#[derive(Debug, Clone, Copy)]
+pub struct KernelCollapseStats {
+    pub repeat_count: usize,
+    pub median_dur: f64,
+    pub median_rel_start: f64,
+    pub representative_annotation: Option<usize>,
+    pub position_in_block: usize,
+    pub block_len: usize,
+}
+
+/// Collapse statistics for a representative annotation span. `median_dur` is the
+/// median annotation-span duration across the repeated blocks; `kernel_count` is
+/// how many kernels the block brackets.
+#[derive(Debug, Clone, Copy)]
+pub struct AnnotationCollapseStats {
+    pub repeat_count: usize,
+    pub median_dur: f64,
+    pub kernel_count: usize,
 }
 
 /// How exactly two traces are laid out on the shared time axis.
@@ -171,6 +214,42 @@ pub struct App {
     pub kernel_diff_status: Vec<Option<KernelDiff>>,
     /// Screen geometry of the last-rendered lane area, for mouse hit-testing.
     pub lane_layout: LaneLayout,
+    /// Whether repeated annotation blocks are collapsed to a single
+    /// representative each. Orthogonal to `align_mode` (works over normal+diff).
+    pub collapse_enabled: bool,
+    /// The uncollapsed lane set; `self.lanes` equals this when collapse is off.
+    pub raw_lanes: Vec<Lane>,
+    /// The collapsed lane set (first block per repeat group only); `self.lanes`
+    /// equals this when collapse is on. Empty until `build_collapse_groups` runs.
+    pub collapsed_lanes: Vec<Lane>,
+    /// Per-kernel (flat index) collapse stats; `Some` only for representative
+    /// kernels kept in `collapsed_lanes`.
+    pub kernel_collapse_stats: Vec<Option<KernelCollapseStats>>,
+    /// Per-annotation (flat index) collapse stats; `Some` only for
+    /// representative annotations kept in `collapsed_lanes`.
+    pub annotation_collapse_stats: Vec<Option<AnnotationCollapseStats>>,
+    /// Median render duration per representative kernel, applied to the rendered
+    /// width in collapsed mode; `None` clears back to the raw duration.
+    pub kernel_duration_overrides: Vec<Option<f64>>,
+    /// For a hidden kernel, the flat index of the representative that replaces it
+    /// in collapsed mode; used to remap the selection on toggle.
+    pub kernel_representative: Vec<Option<usize>>,
+    /// For a hidden annotation, the flat index of its representative.
+    pub annotation_representative: Vec<Option<usize>>,
+    /// Cached full-resolution diff alignment (positions + statuses + annotation
+    /// spans) for raw mode, computed lazily the first time the user views raw +
+    /// diff. `None` until then; invalidated (set to `None`) whenever align mode
+    /// changes. Keeps the expensive full Myers diff off the default startup path.
+    raw_diff_cache: Option<AlignmentSnapshot>,
+}
+
+/// A frozen copy of the render-override vectors produced by a full-resolution
+/// diff alignment, keyed by flat index so it can be restored wholesale.
+#[derive(Debug, Clone)]
+struct AlignmentSnapshot {
+    kernel_render_overrides: Vec<Option<f64>>,
+    annotation_render_overrides: Vec<Option<(f64, f64)>>,
+    kernel_diff_status: Vec<Option<KernelDiff>>,
 }
 
 impl App {
@@ -233,6 +312,8 @@ impl App {
         let kernel_render_overrides = vec![None; kernels.len()];
         let annotation_render_overrides = vec![None; annotations.len()];
         let kernel_diff_status = vec![None; kernels.len()];
+        let kernel_count_for_stats = kernels.len();
+        let annotation_count_for_stats = annotations.len();
 
         let mut app = App {
             kernels,
@@ -257,7 +338,28 @@ impl App {
             annotation_render_overrides,
             kernel_diff_status,
             lane_layout: LaneLayout::default(),
+            collapse_enabled: false,
+            raw_lanes: Vec::new(),
+            collapsed_lanes: Vec::new(),
+            kernel_collapse_stats: vec![None; kernel_count_for_stats],
+            annotation_collapse_stats: vec![None; annotation_count_for_stats],
+            kernel_duration_overrides: vec![None; kernel_count_for_stats],
+            kernel_representative: vec![None; kernel_count_for_stats],
+            annotation_representative: vec![None; annotation_count_for_stats],
+            raw_diff_cache: None,
         };
+        app.raw_lanes = app.lanes.clone();
+        app.build_collapse_groups();
+        // Collapsed (grouped) view is the default rendering strategy.
+        if !app.collapsed_lanes.is_empty() {
+            app.collapse_enabled = true;
+            app.lanes = app.collapsed_lanes.clone();
+            app.active_lane = app
+                .lanes
+                .iter()
+                .position(|l| !l.is_annotations())
+                .unwrap_or(0);
+        }
         app.recompute_alignment();
         app.clamp_selected_item();
         app
@@ -303,7 +405,10 @@ impl App {
     }
 
     pub fn kernel_render_end(&self, idx: usize) -> f64 {
-        let dur = self.kernels.get(idx).map(|k| k.dur).unwrap_or(0.0);
+        let dur = match self.kernel_duration_overrides.get(idx) {
+            Some(Some(d)) => *d,
+            _ => self.kernels.get(idx).map(|k| k.dur).unwrap_or(0.0),
+        };
         self.kernel_render_ts(idx) + dur
     }
 
@@ -423,6 +528,7 @@ impl App {
             AlignMode::Diff => AlignMode::Normal,
             AlignMode::Normal => AlignMode::Diff,
         };
+        self.raw_diff_cache = None;
         self.recompute_alignment();
         true
     }
@@ -446,18 +552,61 @@ impl App {
         for s in &mut self.kernel_diff_status {
             *s = None;
         }
+        for d in &mut self.kernel_duration_overrides {
+            *d = None;
+        }
 
         if trace_count != 2 || self.align_mode != AlignMode::Diff {
+            if self.collapse_enabled {
+                self.apply_collapse_render();
+            }
             return;
         }
 
+        if self.collapse_enabled {
+            // Diff only the visible representative kernels — a ~15× smaller input
+            // than the full raw sequence — then lay out representative blocks with
+            // median durations. The full raw diff is deferred to `raw_diff_cache`.
+            self.diff_align(&normal_off, |app, stream, tid| {
+                app.visible_stream_kernel_indices(tid, stream)
+            });
+            self.apply_collapse_render();
+        } else {
+            // Raw view: restore the cached full-resolution diff, computing it once
+            // on first use so the expensive full Myers diff stays off startup.
+            if self.raw_diff_cache.is_none() {
+                self.diff_align(&normal_off, |app, stream, tid| {
+                    stream_kernel_indices(&app.kernels, tid, stream)
+                });
+                self.raw_diff_cache = Some(AlignmentSnapshot {
+                    kernel_render_overrides: self.kernel_render_overrides.clone(),
+                    annotation_render_overrides: self.annotation_render_overrides.clone(),
+                    kernel_diff_status: self.kernel_diff_status.clone(),
+                });
+            } else {
+                let snap = self.raw_diff_cache.clone().expect("cache present");
+                self.kernel_render_overrides = snap.kernel_render_overrides;
+                self.annotation_render_overrides = snap.annotation_render_overrides;
+                self.kernel_diff_status = snap.kernel_diff_status;
+            }
+        }
+    }
+
+    /// Runs the per-stream Myers diff over the kernel index sets chosen by
+    /// `pick` (all raw kernels, or only the visible collapsed representatives),
+    /// writing render positions + diff status and carrying annotations along the
+    /// resulting per-stream `TimeMap`.
+    fn diff_align<F>(&mut self, normal_off: &[f64], pick: F)
+    where
+        F: Fn(&App, u64, usize) -> Vec<usize>,
+    {
         let mut streams: Vec<u64> = self.kernels.iter().map(|k| k.stream).collect();
         streams.sort_unstable();
         streams.dedup();
 
         for stream in streams {
-            let idx0 = stream_kernel_indices(&self.kernels, 0, stream);
-            let idx1 = stream_kernel_indices(&self.kernels, 1, stream);
+            let idx0 = pick(self, stream, 0);
+            let idx1 = pick(self, stream, 1);
             if idx0.is_empty() || idx1.is_empty() {
                 continue;
             }
@@ -475,6 +624,293 @@ impl App {
             self.remap_stream_annotations(stream, 0, &map0);
             self.remap_stream_annotations(stream, 1, &map1);
         }
+    }
+
+    /// Flat kernel indices for one trace's one stream that are VISIBLE in the
+    /// collapsed lane set (representatives + un-bracketed kernels), sorted by raw
+    /// timestamp. This is the reduced input diffed in collapsed mode.
+    fn visible_stream_kernel_indices(&self, trace_id: usize, stream: u64) -> Vec<usize> {
+        let mut idx: Vec<usize> = self
+            .collapsed_lanes
+            .iter()
+            .filter_map(|l| match l {
+                Lane::Kernels {
+                    stream_id,
+                    trace_id: tid,
+                    item_indices,
+                } if *stream_id == stream && *tid == trace_id => Some(item_indices),
+                _ => None,
+            })
+            .flatten()
+            .copied()
+            .collect();
+        idx.sort_by(|&a, &b| {
+            self.kernels[a]
+                .ts
+                .partial_cmp(&self.kernels[b].ts)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        idx
+    }
+
+    /// Detects repeated annotation blocks and populates every collapse-related
+    /// side table plus `collapsed_lanes`. Runs once at construction.
+    ///
+    /// A *block* is one annotation instance together with the ordered kernels
+    /// whose raw start falls inside its `[ts, end_ts)` span (same trace+stream).
+    /// Blocks are grouped by `(trace_id, stream, annotation.name, kernel-name
+    /// signature)`; only the first block per group stays visible, the rest are
+    /// hidden and their durations fold into per-position medians on the
+    /// representative. Kernels not bracketed by any annotation are always visible.
+    fn build_collapse_groups(&mut self) {
+        let mut groups: HashMap<CollapseKey, Vec<AnnotationBlock>> = HashMap::new();
+        let mut order: Vec<CollapseKey> = Vec::new();
+
+        for lane in &self.raw_lanes {
+            let Lane::Annotations {
+                stream_id,
+                trace_id,
+                item_indices,
+            } = lane
+            else {
+                continue;
+            };
+            for &ann_idx in item_indices {
+                let ann = &self.annotations[ann_idx];
+                let kernels = self.kernels_in_annotation(*trace_id, *stream_id, ann.ts, ann.end_ts());
+                if kernels.is_empty() {
+                    continue;
+                }
+                let key = CollapseKey {
+                    trace_id: *trace_id,
+                    stream: *stream_id,
+                    name: ann.name.clone(),
+                };
+                let block = AnnotationBlock {
+                    annotation: ann_idx,
+                    kernels,
+                };
+                if !groups.contains_key(&key) {
+                    order.push(key.clone());
+                }
+                groups.entry(key).or_default().push(block);
+            }
+        }
+
+        let mut hidden_kernels: std::collections::HashSet<usize> = std::collections::HashSet::new();
+        let mut hidden_annotations: std::collections::HashSet<usize> =
+            std::collections::HashSet::new();
+
+        for key in &order {
+            let blocks = &groups[key];
+            let rep = &blocks[0];
+            let repeat_count = blocks.len();
+            let block_len = rep.kernels.len();
+
+            let ann_durs: Vec<f64> = blocks
+                .iter()
+                .map(|b| self.annotations[b.annotation].dur)
+                .collect();
+            self.annotation_collapse_stats[rep.annotation] = Some(AnnotationCollapseStats {
+                repeat_count,
+                median_dur: median_of(&ann_durs),
+                kernel_count: block_len,
+            });
+
+            for pos in 0..block_len {
+                let durs: Vec<f64> = blocks
+                    .iter()
+                    .filter_map(|b| b.kernels.get(pos).map(|&ki| self.kernels[ki].dur))
+                    .collect();
+                let rel_starts: Vec<f64> = blocks
+                    .iter()
+                    .filter_map(|b| {
+                        b.kernels
+                            .get(pos)
+                            .map(|&ki| self.kernels[ki].ts - self.annotations[b.annotation].ts)
+                    })
+                    .collect();
+                let rep_kernel = rep.kernels[pos];
+                self.kernel_collapse_stats[rep_kernel] = Some(KernelCollapseStats {
+                    repeat_count,
+                    median_dur: median_of(&durs),
+                    median_rel_start: median_of(&rel_starts),
+                    representative_annotation: Some(rep.annotation),
+                    position_in_block: pos,
+                    block_len,
+                });
+            }
+
+            for block in blocks.iter().skip(1) {
+                hidden_annotations.insert(block.annotation);
+                self.annotation_representative[block.annotation] = Some(rep.annotation);
+                for (pos, &ki) in block.kernels.iter().enumerate() {
+                    hidden_kernels.insert(ki);
+                    let rep_kernel = rep.kernels.get(pos).copied().unwrap_or(rep.kernels[block_len - 1]);
+                    self.kernel_representative[ki] = Some(rep_kernel);
+                }
+            }
+        }
+
+        self.collapsed_lanes = self
+            .raw_lanes
+            .iter()
+            .map(|lane| match lane {
+                Lane::Kernels {
+                    stream_id,
+                    trace_id,
+                    item_indices,
+                } => Lane::Kernels {
+                    stream_id: *stream_id,
+                    trace_id: *trace_id,
+                    item_indices: item_indices
+                        .iter()
+                        .copied()
+                        .filter(|ki| !hidden_kernels.contains(ki))
+                        .collect(),
+                },
+                Lane::Annotations {
+                    stream_id,
+                    trace_id,
+                    item_indices,
+                } => Lane::Annotations {
+                    stream_id: *stream_id,
+                    trace_id: *trace_id,
+                    item_indices: item_indices
+                        .iter()
+                        .copied()
+                        .filter(|ai| !hidden_annotations.contains(ai))
+                        .collect(),
+                },
+            })
+            .collect();
+    }
+
+    /// Ordered flat kernel indices whose raw start falls within `[ts, end)` on
+    /// the given trace+stream, sorted by raw start.
+    fn kernels_in_annotation(&self, trace_id: usize, stream: u64, ts: f64, end: f64) -> Vec<usize> {
+        let mut idx: Vec<usize> = self
+            .kernels
+            .iter()
+            .enumerate()
+            .filter(|(_, k)| {
+                k.trace_id == trace_id && k.stream == stream && k.ts >= ts && k.ts < end
+            })
+            .map(|(i, _)| i)
+            .collect();
+        idx.sort_by(|&a, &b| {
+            self.kernels[a]
+                .ts
+                .partial_cmp(&self.kernels[b].ts)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        idx
+    }
+
+    /// Second alignment pass (collapse only): rewrites each representative
+    /// annotation span and its kernels' render starts so the visible block uses
+    /// median durations laid out contiguously from the annotation's start, and
+    /// fills `kernel_duration_overrides` so the render width reflects the median.
+    fn apply_collapse_render(&mut self) {
+        for i in 0..self.kernels.len() {
+            self.kernel_duration_overrides[i] = None;
+        }
+        for ann_idx in 0..self.annotations.len() {
+            let Some(stats) = self.annotation_collapse_stats[ann_idx] else {
+                continue;
+            };
+            if stats.repeat_count <= 1 {
+                continue;
+            }
+            let (ann_start, _) = match self.annotation_render_overrides[ann_idx] {
+                Some(span) => span,
+                None => (self.annotations[ann_idx].ts, self.annotations[ann_idx].end_ts()),
+            };
+            self.annotation_render_overrides[ann_idx] =
+                Some((ann_start, ann_start + stats.median_dur));
+        }
+        for ki in 0..self.kernels.len() {
+            let Some(stats) = self.kernel_collapse_stats[ki] else {
+                continue;
+            };
+            if stats.repeat_count <= 1 {
+                continue;
+            }
+            let Some(ann_idx) = stats.representative_annotation else {
+                continue;
+            };
+            let (ann_start, _) = match self.annotation_render_overrides[ann_idx] {
+                Some(span) => span,
+                None => (self.annotations[ann_idx].ts, self.annotations[ann_idx].end_ts()),
+            };
+            self.kernel_render_overrides[ki] = Some(ann_start + stats.median_rel_start);
+            self.kernel_duration_overrides[ki] = Some(stats.median_dur);
+        }
+    }
+
+    /// Toggles collapse of repeated annotation blocks. Swaps the active lane set,
+    /// recomputes render positions, remaps any now-hidden selection onto its
+    /// representative, and rebuilds an active search. Orthogonal to align mode.
+    pub fn toggle_collapse(&mut self) -> bool {
+        if self.collapsed_lanes.is_empty() && !self.collapse_enabled {
+            return false;
+        }
+        let prev_item = self
+            .lanes
+            .get(self.active_lane)
+            .and_then(|l| l.item_indices().get(self.selected_item).copied());
+        let prev_is_annotation = self
+            .lanes
+            .get(self.active_lane)
+            .map(|l| l.is_annotations())
+            .unwrap_or(false);
+
+        self.collapse_enabled = !self.collapse_enabled;
+        self.lanes = if self.collapse_enabled {
+            self.collapsed_lanes.clone()
+        } else {
+            self.raw_lanes.clone()
+        };
+
+        self.recompute_alignment();
+        self.remap_selection(prev_item, prev_is_annotation);
+
+        if !self.search_query.is_empty() {
+            self.search_apply();
+        }
+        true
+    }
+
+    /// After a collapse toggle, re-anchors the selection onto the same flat item
+    /// if it is still visible, or onto its representative when it was hidden by
+    /// collapse. Falls back to clamping when nothing matches.
+    fn remap_selection(&mut self, prev_item: Option<usize>, prev_is_annotation: bool) {
+        let Some(prev) = prev_item else {
+            self.clamp_selected_item();
+            return;
+        };
+        let target = if self.collapse_enabled {
+            if prev_is_annotation {
+                self.annotation_representative[prev].unwrap_or(prev)
+            } else {
+                self.kernel_representative.get(prev).copied().flatten().unwrap_or(prev)
+            }
+        } else {
+            prev
+        };
+        for (lane_idx, lane) in self.lanes.iter().enumerate() {
+            let matches_kind = lane.is_annotations() == prev_is_annotation;
+            if !matches_kind {
+                continue;
+            }
+            if let Some(pos) = lane.item_indices().iter().position(|&i| i == target) {
+                self.active_lane = lane_idx;
+                self.selected_item = pos;
+                self.clamp_selected_item();
+                return;
+            }
+        }
+        self.clamp_selected_item();
     }
 
     /// Per-trace normal offset that zero-bases every trace to the earliest raw
@@ -531,6 +967,42 @@ impl App {
                 self.annotations.get(idx).map(SelectedTraceItem::Annotation)
             }
         }
+    }
+
+    /// Collapse stats for the selected kernel, present only when collapse is on
+    /// and the selection is a representative of a repeated block.
+    pub fn selected_kernel_collapse_stats(&self) -> Option<KernelCollapseStats> {
+        if !self.collapse_enabled {
+            return None;
+        }
+        let lane = self.lanes.get(self.active_lane)?;
+        if lane.is_annotations() {
+            return None;
+        }
+        let idx = *lane.item_indices().get(self.selected_item)?;
+        self.kernel_collapse_stats
+            .get(idx)
+            .copied()
+            .flatten()
+            .filter(|s| s.repeat_count > 1)
+    }
+
+    /// Collapse stats for the selected annotation, present only when collapse is
+    /// on and the selection is a representative of a repeated block.
+    pub fn selected_annotation_collapse_stats(&self) -> Option<AnnotationCollapseStats> {
+        if !self.collapse_enabled {
+            return None;
+        }
+        let lane = self.lanes.get(self.active_lane)?;
+        if !lane.is_annotations() {
+            return None;
+        }
+        let idx = *lane.item_indices().get(self.selected_item)?;
+        self.annotation_collapse_stats
+            .get(idx)
+            .copied()
+            .flatten()
+            .filter(|s| s.repeat_count > 1)
     }
 
     // ── Item navigation (A/D) — no wrap, matches previous kernel navigation ──
@@ -919,10 +1391,20 @@ impl App {
     }
 
     /// CSV of every kernel in the active lane (raw timestamps, full fields), or
-    /// `None` when the active lane is not a kernel lane. Row order matches the
-    /// lane's on-screen order.
+    /// `None` when the active lane is not a kernel lane. Always exports the full
+    /// uncollapsed lane so a scripted/MCP dump never drops repeated blocks, even
+    /// when the collapsed view is active. Row order matches the raw lane order.
     pub fn lane_kernels_csv(&self) -> Option<String> {
-        let lane = self.lanes.get(self.active_lane)?;
+        let active = self.lanes.get(self.active_lane)?;
+        if active.is_annotations() {
+            return None;
+        }
+        let (stream, trace_id) = (active.stream_id(), active.trace_id());
+        let lane = self
+            .raw_lanes
+            .iter()
+            .find(|l| !l.is_annotations() && l.stream_id() == stream && l.trace_id() == trace_id)
+            .unwrap_or(active);
         let Lane::Kernels { item_indices, .. } = lane else {
             return None;
         };
@@ -1074,13 +1556,21 @@ impl App {
     pub fn global_time_bounds(&self) -> (f64, f64) {
         let mut min_start = f64::MAX;
         let mut max_end = f64::MIN;
-        for (i, _) in self.kernels.iter().enumerate() {
-            min_start = min_start.min(self.kernel_render_ts(i));
-            max_end = max_end.max(self.kernel_render_end(i));
-        }
-        for (i, _) in self.annotations.iter().enumerate() {
-            min_start = min_start.min(self.annotation_render_ts(i));
-            max_end = max_end.max(self.annotation_render_end(i));
+        for lane in &self.lanes {
+            match lane {
+                Lane::Kernels { item_indices, .. } => {
+                    for &i in item_indices {
+                        min_start = min_start.min(self.kernel_render_ts(i));
+                        max_end = max_end.max(self.kernel_render_end(i));
+                    }
+                }
+                Lane::Annotations { item_indices, .. } => {
+                    for &i in item_indices {
+                        min_start = min_start.min(self.annotation_render_ts(i));
+                        max_end = max_end.max(self.annotation_render_end(i));
+                    }
+                }
+            }
         }
         if min_start > max_end {
             (0.0, 1.0)
@@ -1171,18 +1661,21 @@ impl TimeMap {
         if t >= last_raw {
             return t + (last_render - last_raw);
         }
-        for w in self.controls.windows(2) {
-            let (raw_i, render_i) = w[0];
-            let (raw_j, render_j) = w[1];
-            if raw_i <= t && t <= raw_j {
-                if raw_j == raw_i {
-                    return t + (render_i - raw_i);
-                }
-                let alpha = (t - raw_i) / (raw_j - raw_i);
-                return render_i + alpha * (render_j - render_i);
-            }
+        // Controls are sorted by raw ts (see `new`), so binary-search the
+        // enclosing segment instead of scanning — this runs once per annotation,
+        // so a linear scan here is O(annotations × controls).
+        let j = self
+            .controls
+            .partition_point(|&(raw, _)| raw <= t)
+            .max(1)
+            .min(n - 1);
+        let (raw_i, render_i) = self.controls[j - 1];
+        let (raw_j, render_j) = self.controls[j];
+        if raw_j == raw_i {
+            return t + (render_i - raw_i);
         }
-        t + (last_render - last_raw)
+        let alpha = (t - raw_i) / (raw_j - raw_i);
+        render_i + alpha * (render_j - render_i)
     }
 }
 
@@ -3060,6 +3553,95 @@ mod tests {
         assert!(app.annotation_render_end(c1) >= app.annotation_render_ts(c1));
     }
 
+    // ── Collapsed-sequence diff optimization ─────────────────────────────────
+
+    /// Two traces each with `reps` identical decode blocks (annotation "decode"
+    /// bracketing a `p`/`q` kernel pair) on stream 1, so the collapsed view keeps
+    /// one representative block per trace and the diff runs on the reduced input.
+    fn two_trace_repeated(reps0: usize, reps1: usize) -> (Trace, Trace) {
+        let build = |reps: usize| -> Trace {
+            let mut kernels = Vec::new();
+            let mut annotations = Vec::new();
+            let mut t = 0.0;
+            for _ in 0..reps {
+                kernels.push(kd(1, t, "p", 10.0));
+                kernels.push(kd(1, t + 20.0, "q", 4.0));
+                annotations.push(ann_dur(1, t, 40.0, "decode"));
+                t += 50.0;
+            }
+            trace_of(kernels, annotations)
+        };
+        (build(reps0), build(reps1))
+    }
+
+    #[test]
+    fn test_collapsed_diff_marks_only_visible_reps() {
+        // Both traces share the decode phase; collapsed diff should find the
+        // representative p/q matched (no Added/Deleted) despite differing counts.
+        let (t0, t1) = two_trace_repeated(15, 12);
+        let app = App::new_multi(vec![("T0".into(), t0), ("T1".into(), t1)]);
+        assert_eq!(app.align_mode, AlignMode::Diff);
+        assert!(app.collapse_enabled, "collapsed is default");
+        // Representative p/q on both traces are matched (shared phase), not diffed.
+        for tid in 0..2 {
+            let p = kidx(&app, tid, "p", 0.0);
+            assert_eq!(app.kernel_diff(p), None, "matched representative p (t{tid})");
+        }
+    }
+
+    #[test]
+    fn test_raw_diff_computed_lazily_on_toggle_off() {
+        // Trace 1 has an extra decode rep (13 vs 12). In RAW mode the full diff
+        // must mark the surplus trace-1 kernels — proving the lazy full diff runs.
+        let (t0, t1) = two_trace_repeated(12, 13);
+        let mut app = App::new_multi(vec![("T0".into(), t0), ("T1".into(), t1)]);
+        // Cache not yet built while collapsed.
+        assert!(app.raw_diff_cache.is_none());
+        // Toggle to raw view.
+        assert!(app.toggle_collapse());
+        assert!(!app.collapse_enabled);
+        assert!(app.raw_diff_cache.is_some(), "raw diff cached on first raw view");
+        // The 13th decode block on trace 1 is an insertion -> its p/q are Added.
+        let surplus_p = app
+            .kernels
+            .iter()
+            .enumerate()
+            .filter(|(_, k)| k.trace_id == 1 && k.name == "p")
+            .map(|(i, _)| i)
+            .last()
+            .unwrap();
+        assert_eq!(
+            app.kernel_diff(surplus_p),
+            Some(KernelDiff::Added),
+            "surplus trace-1 decode kernel is Added in the full raw diff"
+        );
+    }
+
+    #[test]
+    fn test_raw_diff_cache_reused_on_round_trip() {
+        let (t0, t1) = two_trace_repeated(12, 13);
+        let mut app = App::new_multi(vec![("T0".into(), t0), ("T1".into(), t1)]);
+        app.toggle_collapse(); // -> raw, builds cache
+        let cached = app.raw_diff_cache.clone().expect("cache built");
+        app.toggle_collapse(); // -> collapsed
+        app.toggle_collapse(); // -> raw again, must reuse cache
+        let reused = app.raw_diff_cache.clone().expect("cache still present");
+        assert_eq!(
+            cached.kernel_diff_status, reused.kernel_diff_status,
+            "raw diff identical across round-trip"
+        );
+    }
+
+    #[test]
+    fn test_align_mode_toggle_invalidates_raw_diff_cache() {
+        let (t0, t1) = two_trace_repeated(12, 13);
+        let mut app = App::new_multi(vec![("T0".into(), t0), ("T1".into(), t1)]);
+        app.toggle_collapse(); // raw, builds cache
+        assert!(app.raw_diff_cache.is_some());
+        app.toggle_align_mode();
+        assert!(app.raw_diff_cache.is_none(), "align-mode change clears the cache");
+    }
+
     // S2: normal mode zero-bases every trace to the common start; both traces'
     // earliest events coincide. Applies for >2 traces and the 2-trace toggle.
     #[test]
@@ -3640,5 +4222,194 @@ mod tests {
         // Common prefix "a" + suffix "c" would leave one empty -> index fallback.
         let labels = vec!["ac".to_string(), "abc".to_string()];
         assert_eq!(shorten_labels(&labels), vec!["T0", "T1"]);
+    }
+
+    // ── Collapse of repeated annotation blocks (C key) ───────────────────────
+
+    /// Builds a trace on one stream with `reps` identical decode blocks (each a
+    /// `p`/`q` kernel pair under a same-named annotation), every block separated
+    /// by a lone `nccl` kernel under its own annotation.
+    fn collapse_trace(reps: usize) -> Trace {
+        let mut kernels = Vec::new();
+        let mut annotations = Vec::new();
+        let mut t = 0.0;
+        for r in 0..reps {
+            let ann_start = t;
+            kernels.push(kernel_named(4, t, "p", 10.0 + r as f64));
+            kernels.push(kernel_named(4, t + 20.0, "q", 4.0));
+            annotations.push(AnnotationEvent {
+                name: "decode".to_string(),
+                ts: ann_start,
+                dur: 40.0,
+                stream: 4,
+                trace_id: 0,
+            });
+            t += 50.0;
+            // Lone nccl kernel under its own annotation between decode blocks.
+            kernels.push(kernel_named(4, t, "nccl", 3.0));
+            annotations.push(AnnotationEvent {
+                name: "nccl".to_string(),
+                ts: t,
+                dur: 5.0,
+                stream: 4,
+                trace_id: 0,
+            });
+            t += 30.0;
+        }
+        Trace { kernels, annotations }
+    }
+
+    fn kernel_named(stream: u64, ts: f64, name: &str, dur: f64) -> KernelEvent {
+        KernelEvent {
+            name: name.to_string(),
+            cat: "kernel".to_string(),
+            ts,
+            dur,
+            device: 0,
+            stream,
+            grid: None,
+            block: None,
+            shared_memory: None,
+            registers_per_thread: None,
+            correlation: None,
+            trace_id: 0,
+        }
+    }
+
+    #[test]
+    fn test_collapse_groups_repeat_count() {
+        let app = App::new(collapse_trace(15));
+        // The representative decode annotation carries repeat_count == 15.
+        let rep = app
+            .annotation_collapse_stats
+            .iter()
+            .flatten()
+            .find(|s| s.repeat_count == 15)
+            .expect("a decode group with 15 reps exists");
+        assert_eq!(rep.kernel_count, 2);
+        // Median of first-position durs 10..24 (p) == 17.0.
+        let rep_kernel = app
+            .kernel_collapse_stats
+            .iter()
+            .flatten()
+            .find(|s| s.repeat_count == 15 && s.position_in_block == 0)
+            .expect("representative p kernel");
+        assert!((rep_kernel.median_dur - 17.0).abs() < 1e-9, "median p dur");
+    }
+
+    #[test]
+    fn test_collapse_hides_repeats_keeps_first() {
+        let app = App::new(collapse_trace(15));
+        let raw_decode = count_kernels_named(&app.raw_lanes, &app.kernels, "p");
+        let col_decode = count_kernels_named(&app.collapsed_lanes, &app.kernels, "p");
+        assert_eq!(raw_decode, 15, "raw has 15 p kernels");
+        assert_eq!(col_decode, 1, "collapsed keeps only the first p kernel");
+    }
+
+    #[test]
+    fn test_collapse_nccl_not_absorbed() {
+        // The lone nccl is its OWN block (annotation "nccl"), never folded into
+        // the decode block. Decode's representative brackets exactly the p/q
+        // pair — no nccl — so the decode signature has length 2. The 15 identical
+        // nccl blocks collapse among themselves to a single representative.
+        let app = App::new(collapse_trace(15));
+        let decode = app
+            .annotation_collapse_stats
+            .iter()
+            .enumerate()
+            .find_map(|(i, s)| s.filter(|s| s.repeat_count == 15).map(|s| (i, s)))
+            .expect("decode group");
+        assert_eq!(decode.1.kernel_count, 2, "decode block is p/q only, no nccl");
+        assert_eq!(app.annotations[decode.0].name, "decode");
+        // nccl collapses to its own single representative, separate from decode.
+        let col_nccl = count_kernels_named(&app.collapsed_lanes, &app.kernels, "nccl");
+        assert_eq!(col_nccl, 1, "nccl collapses among nccl blocks, not into decode");
+    }
+
+    #[test]
+    fn test_collapse_singleton_stays_visible() {
+        // reps == 1 → nothing repeats → collapsed lanes equal raw lanes.
+        let app = App::new(collapse_trace(1));
+        assert_eq!(
+            count_kernels_named(&app.collapsed_lanes, &app.kernels, "p"),
+            1
+        );
+        assert_eq!(
+            count_kernels_named(&app.collapsed_lanes, &app.kernels, "nccl"),
+            1
+        );
+    }
+
+    #[test]
+    fn test_toggle_collapse_round_trip_identity() {
+        let mut app = App::new(collapse_trace(15));
+        // Collapse is the default; toggle OFF to capture the raw baseline.
+        assert!(app.collapse_enabled, "collapse on by default");
+        assert!(app.toggle_collapse(), "toggle off");
+        assert!(!app.collapse_enabled);
+        let before: Vec<Vec<usize>> =
+            app.lanes.iter().map(|l| l.item_indices().to_vec()).collect();
+        assert!(app.toggle_collapse(), "toggle on");
+        assert!(app.collapse_enabled);
+        // Collapsed lane has fewer p kernels.
+        assert_eq!(count_kernels_named(&app.lanes, &app.kernels, "p"), 1);
+        assert!(app.toggle_collapse(), "toggle off");
+        assert!(!app.collapse_enabled);
+        let after: Vec<Vec<usize>> =
+            app.lanes.iter().map(|l| l.item_indices().to_vec()).collect();
+        assert_eq!(before, after, "round-trip restores raw lanes exactly");
+        // Duration overrides cleared when collapse off.
+        assert!(app.kernel_duration_overrides.iter().all(|d| d.is_none()));
+    }
+
+    #[test]
+    fn test_toggle_collapse_remaps_hidden_selection() {
+        let mut app = App::new(collapse_trace(15));
+        // Start from the raw view so a hidden repeat can be selected.
+        assert!(app.toggle_collapse(), "toggle off to raw");
+        // Select a kernel lane and a hidden repeat (a later "p" kernel).
+        let kernel_lane = app.lanes.iter().position(|l| !l.is_annotations()).unwrap();
+        app.active_lane = kernel_lane;
+        // Pick a "p" kernel from a non-first block (position of 8th p in lane).
+        let lane_items = app.lanes[kernel_lane].item_indices().to_vec();
+        let p_positions: Vec<usize> = lane_items
+            .iter()
+            .enumerate()
+            .filter(|(_, &ki)| app.kernels[ki].name == "p")
+            .map(|(pos, _)| pos)
+            .collect();
+        app.selected_item = p_positions[7];
+        let hidden_flat = lane_items[p_positions[7]];
+        assert!(app.toggle_collapse(), "toggle on");
+        // Selection must now point at the representative p kernel (flat idx of
+        // the first p), which is the rep for the hidden one.
+        let sel_flat = app.lanes[app.active_lane].item_indices()[app.selected_item];
+        let expected_rep = app.kernel_representative[hidden_flat].unwrap();
+        assert_eq!(sel_flat, expected_rep, "selection remapped to representative");
+        assert_eq!(app.kernels[sel_flat].name, "p");
+    }
+
+    #[test]
+    fn test_collapse_global_bounds_excludes_hidden() {
+        let mut app = App::new(collapse_trace(15));
+        // Default is collapsed; capture collapsed bounds, then compare to raw.
+        let (_, col_end) = app.global_time_bounds();
+        app.toggle_collapse();
+        let (_, raw_end) = app.global_time_bounds();
+        assert!(
+            col_end < raw_end,
+            "collapsed bounds shrink: {} < {}",
+            col_end,
+            raw_end
+        );
+    }
+
+    fn count_kernels_named(lanes: &[Lane], kernels: &[KernelEvent], name: &str) -> usize {
+        lanes
+            .iter()
+            .filter(|l| !l.is_annotations())
+            .flat_map(|l| l.item_indices())
+            .filter(|&&ki| kernels[ki].name == name)
+            .count()
     }
 }
