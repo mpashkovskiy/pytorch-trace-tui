@@ -20,4 +20,4 @@ demo.gif: target/x86_64-unknown-linux-musl/release/pytorch-trace-tui demo.tape #
 	vhs demo.tape --output demo-raw.gif
 	ffmpeg -y -i demo-raw.gif -vf "fps=$(LI_FPS),palettegen=max_colors=256" /tmp/li-pal.png
 	ffmpeg -y -i demo-raw.gif -i /tmp/li-pal.png -lavfi "fps=$(LI_FPS) [x]; [x][1:v] paletteuse" demo.gif
-	@rm -f /tmp/li-pal.png demo-raw.gif
+	@rm -f /tmp/li-pal.png demo-raw.gif kernel-sequence-*.csv
